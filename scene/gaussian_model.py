@@ -231,7 +231,10 @@ class GaussianModel:
         data, counts = np.unique(np.round(data/voxel_size), axis=0, return_counts=True)
         data = data*voxel_size
 
+        print("-"*100)
+        print("Number of points after voxelization : ", data.shape[0])
         print(counts.mean())
+        print("-"*100)
 
         return data
 
