@@ -228,7 +228,8 @@ class GaussianModel:
 
     def voxelize_sample(self, data=None, voxel_size=0.01):
         np.random.shuffle(data)
-        data, counts = np.unique(np.round(data/voxel_size), axis=0, return_counts=True)*voxel_size
+        data, counts = np.unique(np.round(data/voxel_size), axis=0, return_counts=True)
+        data = data*voxel_size
 
         print(counts.mean())
 
