@@ -226,19 +226,19 @@ class GaussianModel:
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
-    # def voxelize_sample(self, data=None, voxel_size=0.01):
-    #     np.random.shuffle(data)
-    #     data, counts = np.unique(np.round(data/voxel_size), axis=0, return_counts=True)
-    #     data = data*voxel_size
+    def voxelize_sample(self, data=None, voxel_size=0.01):
+        np.random.shuffle(data)
+        data, counts = np.unique(np.round(data/voxel_size), axis=0, return_counts=True)
+        data = data*voxel_size
 
-    #     print("-"*100)
-    #     print("Number of points after voxelization : ", data.shape[0])
-    #     print(counts.mean())
-    #     print("-"*100)
+        print("-"*100)
+        print("Number of points after voxelization : ", data.shape[0])
+        print(counts.mean())
+        print("-"*100)
 
-    #     return data
+        return data
 
-    def voxelize_sample(self, data=None, voxel_size=0.01, avg_max_capacity = 10, decay_rate = 0.5):
+    def _voxelize_sample(self, data=None, voxel_size=0.01, avg_max_capacity = 10, decay_rate = 0.5):
         np.random.shuffle(data)
 
         grid_coords = np.round(data / voxel_size)
