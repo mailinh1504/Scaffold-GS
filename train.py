@@ -101,6 +101,9 @@ def get_vgg_func():
 
     del vgg19
 
+    for param in vgg_f.parameters():
+        param.requires_grad = False
+
     return vgg_f
 
 
