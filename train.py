@@ -104,6 +104,8 @@ def get_vgg_func():
     for param in vgg_f.parameters():
         param.requires_grad = False
 
+    vgg_f = vgg_f.cuda()
+
     return vgg_f
 
 
