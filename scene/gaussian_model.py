@@ -23,7 +23,8 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
 
-
+# ============================================================================================
+# Net version
 class FiLMNet(nn.Module):
     """
     Simple FiLM-style network: processes an anchor feature vector and modulates
@@ -73,6 +74,172 @@ class FiLMNet(nn.Module):
         if self.last_act is not None:
             out = self.last_act(out)
         return out
+
+# FPS: 37.18651
+# SSIM :    0.6103338
+# PSNR :   18.5071049
+# LPIPS:    0.3529382
+
+class LiteFiLMNet(nn.Module):
+    def __init__(self, X_dim, Y_dim, out_dim, hidden_dim=None, activation = None):
+        super().__init__()
+        # 1. Embed X
+        if hidden_dim is None:
+            hidden_dim = X_dim
+
+        self.X_embed = nn.Sequential(
+            nn.Linear(X_dim, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        self.Y_embed = nn.Linear(Y_dim, hidden_dim * 2)
+
+        self.out_net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+        self.last_act = activation
+
+    def forward(self, X, Y):
+        X_embed = self.X_embed(X)
+
+        # Generate gamma and beta
+        gamma_beta = self.Y_embed(Y)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+
+        # Apply FiLM
+        FXY = (gamma * X_embed) + beta
+        out = self.out_net(FXY)
+        if self.last_act is not None:
+            out = self.last_act(out)
+
+        return out
+
+class GatedMLP(nn.Module):
+    def __init__(self, X_dim, Y_dim, out_dim, hidden_dim=None, activation=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = X_dim
+        self.X_embed = nn.Sequential(
+            nn.Linear(X_dim, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # Y generates a "gate" of the same size as X_embed
+        self.Y_gate = nn.Linear(Y_dim, hidden_dim, bias=False)
+
+        self.out_net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+
+        self.last_act = activation
+
+    def forward(self, X, Y):
+        X_embed = self.X_embed(X)
+
+        # Use sigmoid to make the gate values 0-1
+        gate = torch.sigmoid(self.Y_gate(Y))
+
+        # Apply gate
+        FXY = X_embed * gate
+        out = self.out_net(FXY)
+        if self.last_act is not None:
+            out = self.last_act(out)
+
+        return out
+
+class AdditiveNet(nn.Module):
+    def __init__(self, X_dim, Y_dim, out_dim, hidden_dim=None, activation=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = X_dim
+        # Both must embed to the same dimension
+        self.X_embed = nn.Linear(X_dim, hidden_dim)
+        self.Y_embed = nn.Linear(Y_dim, hidden_dim)
+
+        self.out_net = nn.Sequential(
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+        self.last_act = activation
+
+    def forward(self, X, Y):
+        X_embed = self.X_embed(X)
+        Y_embed = self.Y_embed(Y)
+
+        # Add them together
+        FXY = X_embed + Y_embed
+        out = self.out_net(FXY)
+        if self.last_act is not None:
+            out = self.last_act(out)
+
+        return out
+
+class MultiplicativeNet(nn.Module):
+    def __init__(self, X_dim, Y_dim, out_dim, hidden_dim=None, activation=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = X_dim
+        # Both must embed to the same dimension
+        self.X_embed = nn.Linear(X_dim, hidden_dim)
+        self.Y_embed = nn.Linear(Y_dim, hidden_dim)
+
+        self.out_net = nn.Sequential(
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+        self.last_act = activation
+
+    def forward(self, X, Y):
+        X_embed = self.X_embed(X)
+        Y_embed = self.Y_embed(Y)
+
+        # Element-wise multiplication
+        FXY = X_embed * Y_embed
+        out = self.out_net(FXY)
+        if self.last_act is not None:
+            out = self.last_act(out)
+
+        return out
+
+class SymmetricalMLP(nn.Module):
+    def __init__(self, X_dim, Y_dim, out_dim, hidden_dim=None, activation=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = X_dim
+        # Separate embedding layers
+        self.X_embed = nn.Linear(X_dim, hidden_dim)
+
+        y_hidden = Y_dim*4
+
+        self.Y_embed = nn.Linear(Y_dim, y_hidden)
+
+        self.out_net = nn.Sequential(
+            nn.ReLU(True),
+            nn.Linear(hidden_dim + y_hidden, out_dim)
+        )
+        self.last_act = activation
+
+    def forward(self, X, Y):
+        X_embed = self.X_embed(X)
+        Y_embed = self.Y_embed(Y)
+
+        # Concatenate the *embeddings*
+        FXY = torch.cat([X_embed, Y_embed], dim=-1)
+        out = self.out_net(FXY)
+        if self.last_act is not None:
+            out = self.last_act(out)
+        return out
+
+Used_net = FiLMNet
+
+# ============================================================================================
+
 
 class GaussianModel:
 
@@ -161,7 +328,7 @@ class GaussianModel:
             nn.Tanh()
         ).cuda()
         # ==================================================================================================
-        self.mlp_opacity = FiLMNet(feat_dim, 3+self.opacity_dist_dim, n_offsets, activation=nn.Tanh()).cuda()
+        self.mlp_opacity = Used_net(feat_dim, 3+self.opacity_dist_dim, n_offsets, activation=nn.Tanh()).cuda()
         # ==================================================================================================
 
         self.add_cov_dist = add_cov_dist
@@ -172,7 +339,7 @@ class GaussianModel:
             nn.Linear(feat_dim, 7*self.n_offsets),
         ).cuda()
         # ==================================================================================================
-        self.mlp_cov = FiLMNet(feat_dim, 3+self.cov_dist_dim, 7*self.n_offsets).cuda()
+        self.mlp_cov = Used_net(feat_dim, 3+self.cov_dist_dim, 7*self.n_offsets).cuda()
         # ==================================================================================================
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
@@ -184,7 +351,7 @@ class GaussianModel:
         ).cuda()
 
         # ==================================================================================================
-        self.mlp_color = FiLMNet(feat_dim+self.appearance_dim, 3+self.color_dist_dim, 3*self.n_offsets, activation=nn.Sigmoid()).cuda()
+        self.mlp_color = Used_net(feat_dim+self.appearance_dim, 3+self.color_dist_dim, 3*self.n_offsets, activation=nn.Sigmoid()).cuda()
         # ==================================================================================================
 
 
