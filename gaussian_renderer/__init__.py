@@ -73,10 +73,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     if pc.appearance_dim > 0:
         if pc.add_color_dist:
             # color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
-            color = pc.get_color_mlp(feat, torch.cat([ob_view, ob_dist, appearance], dim=1))
+            color = pc.get_color_mlp(torch.cat([feat, appearance], dim=1), torch.cat([ob_view, ob_dist], dim=1))
         else:
             # color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
-            color = pc.get_color_mlp(feat, torch.cat([ob_view, appearance], dim=1))
+            color = pc.get_color_mlp(torch.cat([feat, appearance], dim=1), torch.cat([ob_view, appearance], dim=1))
     else:
         if pc.add_color_dist:
             # color = pc.get_color_mlp(cat_local_view)

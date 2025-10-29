@@ -40,31 +40,39 @@ class FiLMNet(nn.Module):
         if hidden_dim is None:
             hidden_dim = X_dim
 
-        self.X_embed = nn.Linear(X_dim, hidden_dim)
-        self.Y_embed = nn.Sequential(
-            nn.Linear(Y_dim, hidden_dim),
+        self.X_norm = nn.LayerNorm(X_dim)
+
+        self.X_embed = nn.Sequential(
+            nn.Linear(X_dim, hidden_dim*2),
             nn.ReLU(True),
-            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.Linear(hidden_dim*2, hidden_dim),
         )
-        self.after_cond = nn.Linear(hidden_dim, hidden_dim)
+
+        self.Y_embed = nn.Sequential(
+            nn.Linear(Y_dim, hidden_dim*2),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim*2, hidden_dim*2),
+        )
+        self.cond_norm = nn.LayerNorm(hidden_dim)
         self.out = nn.Linear(hidden_dim, out_dim)
         self.last_act = activation
 
     def forward(self, X, Y):
+        # X_embed = Linear(ReLU(Linear(X)))
+        # gamma, beta = Linear(ReLU(Linear(Y))).chunk(2)
+        # FXY = gamma * X_embed + beta
+        # out = Linear(FXY)
+
         # feature: (B, feat_dim)
         # cond: (B, cond_dim)
-        X_embed = self.X_embed(X)
+        X_embed = self.X_embed(self.X_norm(X))
         # produce gamma and beta for FiLM
-        Y_params = self.Y_embed(Y)
-        gamma, beta = Y_params.chunk(2, dim=-1)
+        gamma, beta = self.Y_embed(Y).chunk(2, dim=-1)
         FXY = gamma * X_embed + beta
-        h = torch.relu(self.after_cond(FXY))
-        out = self.out(h)
+        out = self.out(self.cond_norm(FXY))
         if self.last_act is not None:
             out = self.last_act(out)
         return out
-
-
 
 class GaussianModel:
 
@@ -176,7 +184,7 @@ class GaussianModel:
         ).cuda()
 
         # ==================================================================================================
-        self.mlp_color = FiLMNet(feat_dim, self.appearance_dim+3+self.color_dist_dim, 3*self.n_offsets, activation=nn.Sigmoid()).cuda()
+        self.mlp_color = FiLMNet(feat_dim+self.appearance_dim, 3+self.color_dist_dim, 3*self.n_offsets, activation=nn.Sigmoid()).cuda()
         # ==================================================================================================
 
 
