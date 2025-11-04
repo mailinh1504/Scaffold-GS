@@ -236,7 +236,7 @@ class SymmetricalMLP(nn.Module):
             out = self.last_act(out)
         return out
 
-Used_net = FiLMNet
+Used_net = LiteFiLMNet
 
 # ============================================================================================
 

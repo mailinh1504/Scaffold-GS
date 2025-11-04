@@ -2,7 +2,7 @@ function rand(){
     min=$1
     max=$(($2-$min+1))
     num=$(date +%s%N)
-    echo $(($num%$max+$min))  
+    echo $(($num%$max+$min))
 }
 
 port=$(rand 10000 30000)
