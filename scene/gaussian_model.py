@@ -241,6 +241,8 @@ class GRuBased(nn.Module):
         super(GRuBased, self).__init__()
 
         feat_dim = feat_dim_1 + feat_dim_2
+        if hidden_dim is None:
+            hidden_dim = feat_dim
 
         out_dim = out_dim // 5
 
