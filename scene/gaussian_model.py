@@ -242,6 +242,8 @@ class GRuBased(nn.Module):
 
         feat_dim = feat_dim_1 + feat_dim_2
 
+        out_dim = out_dim // 5
+
         self.first_encoder = nn.Linear(feat_dim, hidden_dim).cuda()
 
         self.gru = nn.GRUCell(input_size=out_dim, hidden_size=hidden_dim).cuda()
