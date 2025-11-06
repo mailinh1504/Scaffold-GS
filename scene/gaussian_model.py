@@ -236,7 +236,49 @@ class SymmetricalMLP(nn.Module):
             out = self.last_act(out)
         return out
 
-Used_net = SymmetricalMLP
+class GRuBased(nn.Module):
+    def __init__(self, feat_dim_1, feat_dim_2, out_dim, hidden_dim=None, activation=None):
+        super(GRuBased, self).__init__()
+
+        feat_dim = feat_dim_1 + feat_dim_2
+
+        self.first_encoder = nn.Linear(feat_dim, hidden_dim).cuda()
+
+        self.gru = nn.GRUCell(input_size=out_dim, hidden_size=hidden_dim).cuda()
+
+        self.fc = nn.Linear(hidden_dim, out_dim).cuda()
+
+        self.last_act = activation
+
+
+    def forward(self, X, Y, k=5):
+        batch_size = X.shape[0]
+
+        X = torch.cat([X, Y], dim=1)
+
+        h_t = self.first_encoder(X)
+
+        o_t = torch.zeros(batch_size, 1).cuda()
+
+        out = []
+
+        for i in range(k):
+            h_t = self.gru(o_t, h_t)
+
+            o_t_ = self.fc(h_t)
+            out.append(o_t_)
+
+            o_t = o_t_.detach()
+
+
+        out = torch.cat(out, dim=1)
+
+        if self.last_act is not None:
+            out = self.last_act(out)
+
+        return out
+
+Used_net = GRuBased
 
 # ============================================================================================
 
