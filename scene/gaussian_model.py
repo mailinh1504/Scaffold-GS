@@ -265,10 +265,10 @@ class GRuBased(nn.Module):
         for i in range(k):
             h_t = self.gru(o_t, h_t)
 
-            o_t_ = self.fc(h_t)
-            out.append(o_t_)
+            o_t = self.fc(h_t)
+            out.append(o_t)
 
-            o_t = o_t_.detach()
+            # o_t = o_t_.detach()
 
 
         out = torch.cat(out, dim=1)
