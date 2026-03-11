@@ -282,7 +282,7 @@ class GRuBased(nn.Module):
 
         return out
 
-Used_net = GRuBased
+Used_net = FiLMNet 
 
 # ============================================================================================
 
