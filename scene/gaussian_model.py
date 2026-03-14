@@ -282,7 +282,7 @@ class GRuBased(nn.Module):
 
         return out
 
-Used_net = FiLMNet 
+Used_net = FiLMNet
 
 # ============================================================================================
 
@@ -505,6 +505,25 @@ class GaussianModel:
         data = np.unique(np.round(data/voxel_size), axis=0)*voxel_size
 
         return data
+
+    def _voxelize_sample(self, data=None, voxel_size=0.01, avg_max_capacity = 10, decay_rate = 0.5):
+        np.random.shuffle(data)
+
+        grid_coords = np.round(data / voxel_size)
+
+        unique_coords, counts = np.unique(grid_coords, axis=0, return_counts=True)
+
+        if counts.mean() > avg_max_capacity:
+
+            while counts.mean() > avg_max_capacity:
+                voxel_size *= decay_rate
+                grid_coords = np.round(data / voxel_size)
+                unique_coords, counts = np.unique(grid_coords, axis=0, return_counts=True)
+
+        # update voxel size
+        self.voxel_size = voxel_size
+
+        return unique_coords * voxel_size
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
