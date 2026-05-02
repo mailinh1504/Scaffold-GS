@@ -258,7 +258,7 @@ def training(
             (1.0 - opt.lambda_dssim) * Ll1
             + opt.lambda_dssim * ssim_loss
             + 0.01 * scaling_reg
-            + (1 - iteration / opt.iterations) * vgg_loss * 0.01 / (C * W * H)
+            + (1 - iteration / opt.iterations) * vgg_loss * 0.001 / (C * W * H)
         )
 
         loss.backward()
