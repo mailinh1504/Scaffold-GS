@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -43,6 +43,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    objects: np.array
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -74,7 +75,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, objects_folder=None):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -103,17 +104,26 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             FovX = focal2fov(focal_length_x, width)
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
-        
+
         # print(f'FovX: {FovX}, FovY: {FovY}')
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
+        object_path = None
+        objects = None
+        if objects_folder is not None:
+            object_path = os.path.join(objects_folder, image_name + '.png')
+            if os.path.exists(object_path):
+                try:
+                    objects = Image.open(object_path)
+                except Exception:
+                    objects = None
 
         # print(f'image: {image.size}')
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                      image_path=image_path, image_name=image_name, width=width, height=height, objects=objects)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -134,7 +144,7 @@ def storePly(path, xyz, rgb):
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
-    
+
     normals = np.zeros_like(xyz)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
@@ -146,7 +156,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
+def readColmapSceneInfo(path, images, eval, lod, llffhold=8, object_path=None):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -159,7 +169,8 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    object_dir = 'object_mask' if object_path == None else object_path
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir), objects_folder=os.path.join(path, object_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
@@ -176,7 +187,7 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
         else:
             train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
             test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
-    
+
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
@@ -221,7 +232,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             extension = ""
 
         c2ws = np.array([frame["transform_matrix"] for frame in frames])
-        
+
         Ts = c2ws[:,:3,3]
 
         ct = 0
@@ -234,13 +245,13 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 continue
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
-            
+
             if idx % 10 == 0:
                 progress_bar.set_postfix({"num": Fore.YELLOW+f"{ct}/{len(frames)}"+Style.RESET_ALL})
                 progress_bar.update(10)
             if idx == len(frames) - 1:
                 progress_bar.close()
-            
+
             ct += 1
             # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
             c2w[:3, 1:3] *= -1
@@ -279,7 +290,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             if fovx is not None:
                 fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-                FovY = fovy 
+                FovY = fovy
                 FovX = fovx
             else:
                 # given focal in pixel unit
@@ -288,7 +299,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
-            
+
             if is_debug and idx > 50:
                 break
     return cam_infos
@@ -298,7 +309,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", ply_pa
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
     test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
-    
+
     if not eval:
         train_cam_infos.extend(test_cam_infos)
         test_cam_infos = []
@@ -310,7 +321,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", ply_pa
         # Since this data set has no colmap data, we start with random points
         num_pts = 10_000
         print(f"Generating random point cloud ({num_pts})...")
-        
+
         # We create random points inside the bounds of the synthetic Blender scenes
         xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
         shs = np.random.random((num_pts, 3)) / 255.0

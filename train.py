@@ -41,7 +41,6 @@ import lpips
 import torch
 import torch.nn as nn
 import torchvision
-import torchvision.models as models
 import torchvision.transforms.functional as tf
 import wandb
 from PIL import Image
@@ -53,6 +52,7 @@ from scene import GaussianModel, Scene
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
+from loss_utils.identity_losses import identity_2d_prototype_ce_loss, identity_3d_smoothness_loss, compute_prototypes
 
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net="vgg").to("cuda")
@@ -90,30 +90,8 @@ def saveRuntimeCode(dst: str) -> None:
     print("Backup Finished!")
 
 
-def get_vgg_func():
-    vgg19 = models.vgg19(pretrained=True)
+# VGG perceptual loss removed for this technique — no helper functions remain
 
-    vgg_f = nn.Sequential(
-        vgg19.features[0],
-        vgg19.features[1],
-        vgg19.features[2],
-    )
-
-    del vgg19
-
-    for param in vgg_f.parameters():
-        param.requires_grad = False
-
-    vgg_f = vgg_f.cuda()
-
-    return vgg_f
-
-
-def get_vgg_loss(vgg_f, render_imgs, gt_imgs):
-    render_features = vgg_f(render_imgs)
-    gt_features = vgg_f(gt_imgs)
-
-    return l1_loss(render_features, gt_features)
 
 
 def training(
@@ -148,8 +126,9 @@ def training(
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
+    prototypes_for_checkpoint = None
 
-    vgg_f = get_vgg_func()
+    # Perceptual VGG loss removed for this technique
 
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -248,7 +227,7 @@ def training(
         ssim_loss = 1.0 - ssim(image, gt_image)
         scaling_reg = scaling.prod(dim=1).mean()
 
-        vgg_loss = get_vgg_loss(vgg_f, image, gt_image)
+        # vgg perceptual loss removed
 
         W = image.shape[-3]
         H = image.shape[-2]
@@ -258,8 +237,123 @@ def training(
             (1.0 - opt.lambda_dssim) * Ll1
             + opt.lambda_dssim * ssim_loss
             + 0.01 * scaling_reg
-            + (1 - iteration / opt.iterations) * vgg_loss * 0.001 / (C * W * H)
         )
+
+        # Identity losses (2D prototype CE + 3D smoothness regularizer)
+        loss_id2d = None
+        loss_id3d = None
+        identity_render = render_pkg.get("identity_render", None)
+
+        if identity_render is not None:
+            # try to obtain SAM/instance masks for this view from the viewpoint object
+            masks = None
+            for attr in ("sam_masks", "masks", "object_masks", "mask_stack"):
+                if hasattr(viewpoint_cam, attr):
+                    masks = getattr(viewpoint_cam, attr)
+                    break
+
+            # fallback: dataset helper
+            if masks is None and hasattr(dataset, "load_masks_for_view"):
+                try:
+                    masks = dataset.load_masks_for_view(viewpoint_cam.image_name)
+                except Exception:
+                    masks = None
+
+            # If we have explicit per-pixel label_map on the camera, prefer that
+            label_map = getattr(viewpoint_cam, 'label_map', None)
+
+            if masks is not None:
+                # Normalize masks to [K, H, W] boolean tensor on same device
+                if not isinstance(masks, torch.Tensor):
+                    masks = torch.from_numpy(masks)
+                masks = masks.to(identity_render.device)
+                if masks.dim() == 3 and masks.shape[0] != identity_render.shape[1]:
+                    # maybe masks are [H, W, K]
+                    if masks.shape[-1] == identity_render.shape[1]:
+                        masks = masks.permute(2, 0, 1)
+                masks = masks.bool()
+
+                # compute prototypes (saved for checkpointing) and 2D CE loss
+                try:
+                    prototypes = compute_prototypes(identity_render, masks)
+                    prototypes_for_checkpoint = prototypes.detach().cpu().numpy()
+                except Exception:
+                    prototypes_for_checkpoint = None
+
+                loss_id2d, meta = identity_2d_prototype_ce_loss(
+                    identity_render,
+                    masks,
+                    temperature=getattr(opt, "id_temperature", 0.07),
+                    ignore_background=getattr(opt, "ignore_bg_label", -1),
+                )
+                # warmup schedule for id2d weight
+                base_w = getattr(opt, "lambda_id2d", 1.0)
+                warm_start = getattr(opt, "id_warmup_start", 0)
+                warm_iters = getattr(opt, "id_warmup_iters", 1000)
+                if iteration <= warm_start:
+                    id_w = 0.0
+                else:
+                    id_w = base_w * min(1.0, float(max(0, iteration - warm_start)) / max(1.0, warm_iters))
+                loss = loss + id_w * loss_id2d
+            elif label_map is not None:
+                # label_map: HxW int per-pixel labels (background = -1)
+                if not isinstance(label_map, torch.Tensor):
+                    lbl = torch.from_numpy(label_map)
+                else:
+                    lbl = label_map
+                lbl = lbl.long()
+                ignore_bg = getattr(opt, "ignore_bg_label", -1)
+                classes = torch.unique(lbl.view(-1))
+                classes = classes[classes != ignore_bg]
+                if classes.numel() > 0:
+                    masks_list = []
+                    for c in classes:
+                        masks_list.append((lbl == int(c)).numpy())
+                    masks_np = np.stack(masks_list, axis=0)
+                    masks_t = torch.from_numpy(masks_np).to(identity_render.device).bool()
+                    try:
+                        prototypes = compute_prototypes(identity_render, masks_t)
+                        prototypes_for_checkpoint = prototypes.detach().cpu().numpy()
+                    except Exception:
+                        prototypes_for_checkpoint = None
+                    loss_id2d, meta = identity_2d_prototype_ce_loss(
+                        identity_render,
+                        masks_t,
+                        temperature=getattr(opt, "id_temperature", 0.07),
+                        ignore_background=ignore_bg,
+                    )
+                    base_w = getattr(opt, "lambda_id2d", 1.0)
+                    warm_start = getattr(opt, "id_warmup_start", 0)
+                    warm_iters = getattr(opt, "id_warmup_iters", 1000)
+                    if iteration <= warm_start:
+                        id_w = 0.0
+                    else:
+                        id_w = base_w * min(1.0, float(max(0, iteration - warm_start)) / max(1.0, warm_iters))
+                    loss = loss + id_w * loss_id2d
+
+        # 3D smoothness regularizer on anchor IDs (periodic like other 3D regs)
+        if iteration % getattr(opt, "reg3d_interval", 2) == 0:
+            try:
+                anchor_ids = gaussians.get_anchor_id
+                anchors_xyz = gaussians.get_anchor
+                if anchor_ids.numel() != 0:
+                    loss_id3d = identity_3d_smoothness_loss(
+                        anchor_ids,
+                        anchors_xyz,
+                        k=getattr(opt, "id_reg_k", 8),
+                        sigma=getattr(opt, "id_reg_sigma", 0.1),
+                    )
+                    # apply warmup to regularizer as well
+                    base_r = getattr(opt, "lambda_idreg", 1e-3)
+                    warm_start_r = getattr(opt, "id_warmup_start", 0)
+                    warm_iters_r = getattr(opt, "id_warmup_iters", 1000)
+                    if iteration <= warm_start_r:
+                        reg_w = 0.0
+                    else:
+                        reg_w = base_r * min(1.0, float(max(0, iteration - warm_start_r)) / max(1.0, warm_iters_r))
+                    loss = loss + reg_w * loss_id3d
+            except Exception:
+                loss_id3d = None
 
         loss.backward()
 
@@ -291,6 +385,23 @@ def training(
                 wandb,
                 logger,
             )
+            # Extra logging for identity losses
+            if tb_writer:
+                if 'loss_id2d' in locals() and (loss_id2d is not None):
+                    tb_writer.add_scalar(f"{dataset_name}/train_loss_patches/id2d_loss", loss_id2d.item(), iteration)
+                if 'loss_id3d' in locals() and (loss_id3d is not None):
+                    tb_writer.add_scalar(f"{dataset_name}/train_loss_patches/id3d_loss", loss_id3d.item(), iteration)
+            if wandb:
+                log_dict = {"iter": iteration}
+                if 'loss_id2d' in locals() and (loss_id2d is not None):
+                    log_dict["train_loss_patches/id2d_loss"] = loss_id2d.item()
+                if 'loss_id3d' in locals() and (loss_id3d is not None):
+                    log_dict["train_loss_patches/id3d_loss"] = loss_id3d.item()
+                if len(log_dict) > 1:
+                    try:
+                        wandb.log(log_dict)
+                    except Exception:
+                        pass
             if iteration in saving_iterations:
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -330,6 +441,12 @@ def training(
                     (gaussians.capture(), iteration),
                     scene.model_path + "/chkpnt" + str(iteration) + ".pth",
                 )
+                # save prototypes separately if available
+                try:
+                    if prototypes_for_checkpoint is not None:
+                        np.save(os.path.join(scene.model_path, f"prototypes_iter_{iteration}.npy"), prototypes_for_checkpoint)
+                except Exception:
+                    pass
 
 
 def prepare_output_and_logger(args):

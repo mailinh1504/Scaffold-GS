@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -16,14 +16,15 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 
 def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False):
-    ## view frustum filtering for acceleration    
+    ## view frustum filtering for acceleration
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
-    
+
     feat = pc._anchor_feat[visible_mask]
     anchor = pc.get_anchor[visible_mask]
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
+    anchor_id = pc.get_anchor_id[visible_mask] if pc.get_anchor_id.numel()>0 else torch.zeros((anchor.shape[0], pc.id_dim), device=anchor.device)
 
     ## get view properties for anchor
     ob_view = anchor - viewpoint_camera.camera_center
@@ -35,7 +36,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     ## view-adaptive feature
     if pc.use_feat_bank:
         cat_view = torch.cat([ob_view, ob_dist], dim=1)
-        
+
         bank_weight = pc.get_featurebank_mlp(cat_view).unsqueeze(dim=1) # [n, 1, 3]
 
         ## multi-resolution feat
@@ -46,8 +47,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         feat = feat.squeeze(dim=-1) # [n, c]
 
 
-    cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
-    cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
+    cat_local_view = torch.cat([feat, ob_view, ob_dist, anchor_id], dim=1) # [N, c+3+1+id]
+    cat_local_view_wodist = torch.cat([feat, ob_view, anchor_id], dim=1) # [N, c+3+id]
     if pc.appearance_dim > 0:
         camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
@@ -64,7 +65,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     mask = (neural_opacity>0.0)
     mask = mask.view(-1)
 
-    # select opacity 
+    # select opacity
     opacity = neural_opacity[mask]
 
     # get offset's color
@@ -86,43 +87,49 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
     scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
-    
+
     # offsets
     offsets = grid_offsets.view([-1, 3]) # [mask]
-    
+    # per-gaussian identity: repeat anchor_id per-offset
+    anchor_id_repeat = repeat(anchor_id, 'n d -> (n k) d', k=pc.n_offsets)
+
     # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
+    concatenated_all = torch.cat([concatenated_repeated, anchor_id_repeat, color, scale_rot, offsets], dim=-1)
     masked = concatenated_all[mask]
-    scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
-    
+    split_sizes = [6, 3, pc.id_dim, 3, 7, 3]
+    scaling_repeat, repeat_anchor, anchor_id_gaussian, color, scale_rot, offsets = masked.split(split_sizes, dim=-1)
+
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
     rot = pc.rotation_activation(scale_rot[:,3:7])
-    
+
     # post-process offsets to get centers for gaussians
     offsets = offsets * scaling_repeat[:,:3]
     xyz = repeat_anchor + offsets
 
+    # combine per-gaussian color + identity into features_precomp for rasterizer
+    features = torch.cat([color, anchor_id_gaussian], dim=-1)
+
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask
+        return xyz, features, opacity, scaling, rot, neural_opacity, mask, anchor_id_gaussian
     else:
-        return xyz, color, opacity, scaling, rot
+        return xyz, features, opacity, scaling, rot, anchor_id_gaussian
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
     is_training = pc.get_color_mlp.training
-        
+
     if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, features, opacity, scaling, rot, neural_opacity, mask, anchor_id_gaussian = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
-        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    
+        xyz, features, opacity, scaling, rot, anchor_id_gaussian = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
@@ -153,40 +160,49 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-    
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
     rendered_image, radii = rasterizer(
         means3D = xyz,
         means2D = screenspace_points,
         shs = None,
-        colors_precomp = color,
+        colors_precomp = features,
         opacities = opacity,
         scales = scaling,
         rotations = rot,
         cov3D_precomp = None)
-    
+
+    # rendered_image shape: (NUM_CHANNELS, H, W) where first 3 are RGB and next id_dim are identity channels
+    id_dim = pc.id_dim
+    rgb_render = rendered_image[:3, :, :]
+    identity_render = rendered_image[3:3+id_dim, :, :]
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
-        return {"render": rendered_image,
+        return {"render": rgb_render,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
-                "scaling": scaling,
+            "scaling": scaling,
+            "anchor_id_gaussian": anchor_id_gaussian,
+            "identity_render": identity_render,
                 }
     else:
-        return {"render": rendered_image,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                }
+        return {"render": rgb_render,
+            "viewspace_points": screenspace_points,
+            "visibility_filter" : radii > 0,
+            "radii": radii,
+            "anchor_id_gaussian": anchor_id_gaussian,
+            "identity_render": identity_render,
+            }
 
 
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
