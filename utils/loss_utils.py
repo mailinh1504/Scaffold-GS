@@ -40,6 +40,26 @@ def ssim(img1, img2, window_size=11, size_average=True):
 
     return _ssim(img1, img2, window, window_size, channel, size_average)
 
+def ms_ssim(img1, img2, window_size=11, size_average=True):
+    weights = img1.new_tensor([0.0448, 0.2856, 0.3001, 0.2363, 0.1333])
+    levels = weights.shape[0]
+    values = []
+
+    for level in range(levels):
+        values.append(ssim(img1, img2, window_size, size_average).clamp(min=1e-6, max=1.0))
+
+        min_spatial_size = min(img1.shape[-2], img1.shape[-1])
+        if level == levels - 1 or min_spatial_size < 2:
+            break
+
+        img1 = F.avg_pool2d(img1, kernel_size=2, stride=2, ceil_mode=True)
+        img2 = F.avg_pool2d(img2, kernel_size=2, stride=2, ceil_mode=True)
+
+    weights = weights[:len(values)]
+    weights = weights / weights.sum()
+    values = torch.stack(values)
+    return torch.prod(values ** weights)
+
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)

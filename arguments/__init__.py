@@ -141,6 +141,10 @@ class OptimizationParams(ParamGroup):
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_l1 = 0.8
+        self.lambda_ssim = 0.15
+        self.lambda_ms_ssim = 0.05
+        self.lambda_vol = 0.01
         # Identity supervision hyperparameters
         self.id_dim = 32
         self.lambda_id2d = 1.0

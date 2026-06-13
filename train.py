@@ -51,7 +51,7 @@ from gaussian_renderer import network_gui, prefilter_voxel, render
 from scene import GaussianModel, Scene
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ms_ssim, ssim
 from loss_utils.identity_losses import identity_2d_prototype_ce_loss, identity_3d_smoothness_loss, compute_prototypes
 
 # torch.set_num_threads(32)
@@ -225,7 +225,8 @@ def training(
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = 1.0 - ssim(image, gt_image)
-        scaling_reg = scaling.prod(dim=1).mean()
+        ms_ssim_loss = 1.0 - ms_ssim(image, gt_image)
+        volume_loss = scaling.prod(dim=1).mean()
 
         # vgg perceptual loss removed
 
@@ -234,9 +235,10 @@ def training(
         C = image.shape[-1]
 
         loss = (
-            (1.0 - opt.lambda_dssim) * Ll1
-            + opt.lambda_dssim * ssim_loss
-            + 0.01 * scaling_reg
+            opt.lambda_l1 * Ll1
+            + opt.lambda_ssim * ssim_loss
+            + opt.lambda_ms_ssim * ms_ssim_loss
+            + opt.lambda_vol * volume_loss
         )
 
         # Identity losses (2D prototype CE + 3D smoothness regularizer)
@@ -387,12 +389,20 @@ def training(
             )
             # Extra logging for identity losses
             if tb_writer:
+                tb_writer.add_scalar(f"{dataset_name}/train_loss_patches/ssim_loss", ssim_loss.item(), iteration)
+                tb_writer.add_scalar(f"{dataset_name}/train_loss_patches/ms_ssim_loss", ms_ssim_loss.item(), iteration)
+                tb_writer.add_scalar(f"{dataset_name}/train_loss_patches/volume_loss", volume_loss.item(), iteration)
                 if 'loss_id2d' in locals() and (loss_id2d is not None):
                     tb_writer.add_scalar(f"{dataset_name}/train_loss_patches/id2d_loss", loss_id2d.item(), iteration)
                 if 'loss_id3d' in locals() and (loss_id3d is not None):
                     tb_writer.add_scalar(f"{dataset_name}/train_loss_patches/id3d_loss", loss_id3d.item(), iteration)
             if wandb:
-                log_dict = {"iter": iteration}
+                log_dict = {
+                    "iter": iteration,
+                    "train_loss_patches/ssim_loss": ssim_loss.item(),
+                    "train_loss_patches/ms_ssim_loss": ms_ssim_loss.item(),
+                    "train_loss_patches/volume_loss": volume_loss.item(),
+                }
                 if 'loss_id2d' in locals() and (loss_id2d is not None):
                     log_dict["train_loss_patches/id2d_loss"] = loss_id2d.item()
                 if 'loss_id3d' in locals() and (loss_id3d is not None):
