@@ -159,8 +159,8 @@ class OptimizationParams(ParamGroup):
         self.adaptive_k_boost = 2.0
         self.adaptive_k_warmup = 1500
         self.opacity_grad_lambda = 2.0
-        self.gradient_phase1_until = 5000
-        self.gradient_phase2_until = 10000
+        self.gradient_phase1_until = 10000
+        self.gradient_phase2_until = 20000
 
         super().__init__(parser, "Optimization Parameters")
 
