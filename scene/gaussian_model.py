@@ -358,6 +358,8 @@ class GaussianModel:
         self.adaptive_k_min = min(2, self.n_offsets)
         self.adaptive_k_threshold = 0.0002
         self.adaptive_k_boost = 2.0
+        self.adaptive_k_tau_min = 0.0001
+        self.adaptive_k_tau_max = 0.0006
         self.opacity_grad_lambda = 2.0
 
         self.optimizer = None
@@ -589,6 +591,8 @@ class GaussianModel:
         self.adaptive_k_min = max(1, min(getattr(training_args, "adaptive_k_min", 2), self.n_offsets))
         self.adaptive_k_threshold = getattr(training_args, "adaptive_k_threshold", training_args.densify_grad_threshold)
         self.adaptive_k_boost = getattr(training_args, "adaptive_k_boost", 2.0)
+        self.adaptive_k_tau_min = getattr(training_args, "adaptive_k_tau_min", training_args.densify_grad_threshold * 0.5)
+        self.adaptive_k_tau_max = getattr(training_args, "adaptive_k_tau_max", training_args.densify_grad_threshold * 3.0)
         self.opacity_grad_lambda = getattr(training_args, "opacity_grad_lambda", 2.0)
         if self._active_offsets.numel() == 0 or self._active_offsets.shape[0] != self.get_anchor.shape[0]:
             initial_k = self.n_offsets if not self.adaptive_k_enabled else self.adaptive_k_min
@@ -1111,8 +1115,9 @@ class GaussianModel:
         grads = self.offset_gradient_accum / self.offset_denom.clamp_min(1.0)
         grads[grads.isnan()] = 0.0
         anchor_scores = grads.view([-1, self.n_offsets]).amax(dim=1, keepdim=True)
-        dynamic_threshold = self.adaptive_k_threshold / (1.0 + self.adaptive_k_boost * (anchor_scores / max(grad_threshold, 1e-12)))
-        relative = (anchor_scores / dynamic_threshold.clamp_min(1e-12)).clamp(0.0, 1.0)
+        tau_min = min(self.adaptive_k_tau_min, self.adaptive_k_tau_max)
+        tau_max = max(self.adaptive_k_tau_min, self.adaptive_k_tau_max)
+        relative = ((anchor_scores - tau_min) / max(tau_max - tau_min, 1e-12)).clamp(0.0, 1.0)
         active_offsets = self.adaptive_k_min + torch.round(relative * (self.n_offsets - self.adaptive_k_min)).long()
         self._active_offsets = active_offsets.clamp(self.adaptive_k_min, self.n_offsets)
 
