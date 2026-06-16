@@ -39,9 +39,7 @@ from random import randint
 # from lpipsPyTorch import lpips
 import lpips
 import torch
-import torch.nn as nn
 import torchvision
-import torchvision.models as models
 import torchvision.transforms.functional as tf
 import wandb
 from PIL import Image
@@ -90,30 +88,12 @@ def saveRuntimeCode(dst: str) -> None:
     print("Backup Finished!")
 
 
-def get_vgg_func():
-    vgg19 = models.vgg19(pretrained=True)
-
-    vgg_f = nn.Sequential(
-        vgg19.features[0],
-        vgg19.features[1],
-        vgg19.features[2],
-    )
-
-    del vgg19
-
-    for param in vgg_f.parameters():
-        param.requires_grad = False
-
-    vgg_f = vgg_f.cuda()
-
-    return vgg_f
-
-
-def get_vgg_loss(vgg_f, render_imgs, gt_imgs):
-    render_features = vgg_f(render_imgs)
-    gt_features = vgg_f(gt_imgs)
-
-    return l1_loss(render_features, gt_features)
+def get_gradient_phase(iteration, opt):
+    if iteration <= opt.gradient_phase1_until:
+        return "position"
+    if iteration <= opt.gradient_phase2_until:
+        return "opacity"
+    return "combined"
 
 
 def training(
@@ -148,8 +128,6 @@ def training(
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
-
-    vgg_f = get_vgg_func()
 
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -200,6 +178,9 @@ def training(
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        gradient_phase = get_gradient_phase(iteration, opt)
+        gaussians.apply_gradient_phase(gradient_phase)
+        gaussians.adaptive_k_enabled = opt.adaptive_k and iteration >= opt.adaptive_k_warmup
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -248,17 +229,12 @@ def training(
         ssim_loss = 1.0 - ssim(image, gt_image)
         scaling_reg = scaling.prod(dim=1).mean()
 
-        vgg_loss = get_vgg_loss(vgg_f, image, gt_image)
-
-        W = image.shape[-3]
-        H = image.shape[-2]
-        C = image.shape[-1]
-
+        
         loss = (
             (1.0 - opt.lambda_dssim) * Ll1
             + opt.lambda_dssim * ssim_loss
             + 0.01 * scaling_reg
-            + (1 - iteration / opt.iterations) * vgg_loss * 0.01 / (C * W * H)
+
         )
 
         loss.backward()
@@ -304,6 +280,7 @@ def training(
                     visibility_filter,
                     offset_selection_mask,
                     voxel_visible_mask,
+                    gradient_phase=gradient_phase,
                 )
 
                 # densification
@@ -317,6 +294,7 @@ def training(
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
+                del gaussians.opacity_gradient_accum
                 del gaussians.offset_denom
                 torch.cuda.empty_cache()
 

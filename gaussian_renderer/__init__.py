@@ -61,8 +61,20 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         # neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
         neural_opacity = pc.get_opacity_mlp(feat, ob_view)
 
+    if pc.adaptive_k_enabled:
+        active_offsets = pc.get_active_offsets(visible_mask).to(neural_opacity.device)
+        offset_ids = torch.arange(pc.n_offsets, device=neural_opacity.device).view(1, -1)
+        adaptive_mask = offset_ids < active_offsets
+        neural_opacity = torch.where(
+            adaptive_mask,
+            neural_opacity,
+            torch.full_like(neural_opacity, -1e6),
+        )
+
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
+    if is_training:
+        neural_opacity.retain_grad()
     mask = (neural_opacity>0.0)
     mask = mask.view(-1)
 

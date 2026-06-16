@@ -152,6 +152,16 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # Adaptive-K Scaffold-GS
+        self.adaptive_k = True
+        self.adaptive_k_min = 2
+        self.adaptive_k_threshold = 0.0002
+        self.adaptive_k_boost = 2.0
+        self.adaptive_k_warmup = 1500
+        self.opacity_grad_lambda = 2.0
+        self.gradient_phase1_until = 5000
+        self.gradient_phase2_until = 10000
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
