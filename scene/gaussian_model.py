@@ -355,11 +355,15 @@ class GaussianModel:
         self.anchor_demon = torch.empty(0)
         self._active_offsets = torch.empty(0)
         self.adaptive_k_enabled = False
-        self.adaptive_k_min = min(2, self.n_offsets)
+        self.adaptive_k_min = min(4, self.n_offsets)
         self.adaptive_k_threshold = 0.0002
         self.adaptive_k_boost = 2.0
         self.adaptive_k_tau_min = 0.0001
         self.adaptive_k_tau_max = 0.0006
+        self.adaptive_k_use_quantile = True
+        self.adaptive_k_quantile_min = 0.30
+        self.adaptive_k_quantile_max = 0.90
+        self.adaptive_k_score_topk = 3
         self.opacity_grad_lambda = 2.0
 
         self.optimizer = None
@@ -588,11 +592,15 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.adaptive_k_enabled = getattr(training_args, "adaptive_k", False)
-        self.adaptive_k_min = max(1, min(getattr(training_args, "adaptive_k_min", 2), self.n_offsets))
+        self.adaptive_k_min = max(1, min(getattr(training_args, "adaptive_k_min", 4), self.n_offsets))
         self.adaptive_k_threshold = getattr(training_args, "adaptive_k_threshold", training_args.densify_grad_threshold)
         self.adaptive_k_boost = getattr(training_args, "adaptive_k_boost", 2.0)
         self.adaptive_k_tau_min = getattr(training_args, "adaptive_k_tau_min", training_args.densify_grad_threshold * 0.5)
         self.adaptive_k_tau_max = getattr(training_args, "adaptive_k_tau_max", training_args.densify_grad_threshold * 3.0)
+        self.adaptive_k_use_quantile = getattr(training_args, "adaptive_k_use_quantile", True)
+        self.adaptive_k_quantile_min = getattr(training_args, "adaptive_k_quantile_min", 0.30)
+        self.adaptive_k_quantile_max = getattr(training_args, "adaptive_k_quantile_max", 0.90)
+        self.adaptive_k_score_topk = max(1, min(getattr(training_args, "adaptive_k_score_topk", 3), self.n_offsets))
         self.opacity_grad_lambda = getattr(training_args, "opacity_grad_lambda", 2.0)
         if self._active_offsets.numel() == 0 or self._active_offsets.shape[0] != self.get_anchor.shape[0]:
             initial_k = self.n_offsets if not self.adaptive_k_enabled else self.adaptive_k_min
@@ -1114,10 +1122,24 @@ class GaussianModel:
 
         grads = self.offset_gradient_accum / self.offset_denom.clamp_min(1.0)
         grads[grads.isnan()] = 0.0
-        anchor_scores = grads.view([-1, self.n_offsets]).amax(dim=1, keepdim=True)
+        anchor_grads = grads.view([-1, self.n_offsets])
+        topk = min(self.adaptive_k_score_topk, self.n_offsets)
+        anchor_scores = anchor_grads.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
+
         tau_min = min(self.adaptive_k_tau_min, self.adaptive_k_tau_max)
         tau_max = max(self.adaptive_k_tau_min, self.adaptive_k_tau_max)
-        relative = ((anchor_scores - tau_min) / max(tau_max - tau_min, 1e-12)).clamp(0.0, 1.0)
+        if self.adaptive_k_use_quantile:
+            anchor_seen = self.offset_denom.view([-1, self.n_offsets]).sum(dim=1) > 0
+            valid_scores = anchor_scores.detach().view(-1)[anchor_seen]
+            if valid_scores.numel() > 1:
+                q_min = min(self.adaptive_k_quantile_min, self.adaptive_k_quantile_max)
+                q_max = max(self.adaptive_k_quantile_min, self.adaptive_k_quantile_max)
+                tau_min = torch.quantile(valid_scores, q_min)
+                tau_max = torch.quantile(valid_scores, q_max)
+
+        tau_min = torch.as_tensor(tau_min, dtype=anchor_scores.dtype, device=anchor_scores.device)
+        tau_max = torch.as_tensor(tau_max, dtype=anchor_scores.dtype, device=anchor_scores.device)
+        relative = ((anchor_scores - tau_min) / (tau_max - tau_min).clamp_min(1e-12)).clamp(0.0, 1.0)
         active_offsets = self.adaptive_k_min + torch.round(relative * (self.n_offsets - self.adaptive_k_min)).long()
         self._active_offsets = active_offsets.clamp(self.adaptive_k_min, self.n_offsets)
 
