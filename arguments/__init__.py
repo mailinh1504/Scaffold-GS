@@ -72,9 +72,10 @@ class ModelParams(ParamGroup):
 
         # In the Bungeenerf dataset, we propose to set the following three parameters to True,
         # Because there are enough dist variations.
-        self.add_opacity_dist = True
-        self.add_cov_dist = True
-        self.add_color_dist = True
+        self.add_opacity_dist = False
+        self.add_cov_dist = False
+        self.add_color_dist = False
+        self.use_film_net = False
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -154,7 +155,7 @@ class OptimizationParams(ParamGroup):
 
         # Adaptive-K Scaffold-GS
         self.adaptive_k = False
-        self.adaptive_k_min = 4
+        self.adaptive_k_min = 6
         self.adaptive_k_threshold = 0.0002
         self.adaptive_k_boost = 2.0
         self.adaptive_k_tau_min = 0.0001
@@ -163,9 +164,10 @@ class OptimizationParams(ParamGroup):
         self.adaptive_k_quantile_min = 0.10
         self.adaptive_k_quantile_max = 0.70
         self.adaptive_k_score_topk = 1
-        self.adaptive_k_warmup = 15000
+        self.adaptive_k_warmup = 12000
         self.opacity_grad_lambda = 2.0
         self.multiphase_gradient = False
+        self.multiphase_soft_lr_scale = 0.25
         self.gradient_phase1_until = 10000
         self.gradient_phase2_until = 20000
 

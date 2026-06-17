@@ -54,12 +54,14 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         appearance = pc.get_appearance(camera_indicies)
 
     # get offset's opacity
-    if pc.add_opacity_dist:
-        # neural_opacity = pc.get_opacity_mlp(cat_local_view) # [N, k]
+    if pc.use_film_net and pc.add_opacity_dist:
         neural_opacity = pc.get_opacity_mlp(feat, torch.cat([ob_view, ob_dist], dim=1)) # [N, k]
-    else:
-        # neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
+    elif pc.add_opacity_dist:
+        neural_opacity = pc.get_opacity_mlp(cat_local_view) # [N, k]
+    elif pc.use_film_net:
         neural_opacity = pc.get_opacity_mlp(feat, ob_view)
+    else:
+        neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
     if pc.adaptive_k_enabled:
         active_offsets = pc.get_active_offsets(visible_mask).to(neural_opacity.device)
@@ -83,27 +85,34 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # get offset's color
     if pc.appearance_dim > 0:
-        if pc.add_color_dist:
-            # color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
+        if pc.use_film_net and pc.add_color_dist:
             color = pc.get_color_mlp(torch.cat([feat, appearance], dim=1), torch.cat([ob_view, ob_dist], dim=1))
+        elif pc.add_color_dist:
+            color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
+        elif pc.use_film_net:
+            color = pc.get_color_mlp(torch.cat([feat, appearance], dim=1), ob_view)
         else:
-            # color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
-            color = pc.get_color_mlp(torch.cat([feat, appearance], dim=1), torch.cat([ob_view, appearance], dim=1))
+            color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
     else:
-        if pc.add_color_dist:
-            # color = pc.get_color_mlp(cat_local_view)
+        if pc.use_film_net and pc.add_color_dist:
             color = pc.get_color_mlp(feat, torch.cat([ob_view, ob_dist], dim=1))
-        else:
+        elif pc.add_color_dist:
+            color = pc.get_color_mlp(cat_local_view)
+        elif pc.use_film_net:
             color = pc.get_color_mlp(feat, ob_view)
+        else:
+            color = pc.get_color_mlp(cat_local_view_wodist)
     color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask]
 
     # get offset's cov
-    if pc.add_cov_dist:
-        # scale_rot = pc.get_cov_mlp(cat_local_view)
+    if pc.use_film_net and pc.add_cov_dist:
         scale_rot = pc.get_cov_mlp(feat, torch.cat([ob_view, ob_dist], dim=1))
-    else:
-        # scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
+    elif pc.add_cov_dist:
+        scale_rot = pc.get_cov_mlp(cat_local_view)
+    elif pc.use_film_net:
         scale_rot = pc.get_cov_mlp(feat, ob_view)
+    else:
+        scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
 
     scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
 

@@ -125,6 +125,7 @@ def training(
         dataset.add_opacity_dist,
         dataset.add_cov_dist,
         dataset.add_color_dist,
+        dataset.use_film_net,
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
@@ -180,11 +181,10 @@ def training(
         gaussians.update_learning_rate(iteration)
         gradient_phase = get_gradient_phase(iteration, opt) if opt.multiphase_gradient else "position"
         if opt.multiphase_gradient:
-            gaussians.apply_gradient_phase(gradient_phase)
+            gaussians.apply_gradient_phase(gradient_phase, opt.multiphase_soft_lr_scale)
         gaussians.adaptive_k_enabled = (
             opt.adaptive_k
             and iteration >= opt.adaptive_k_warmup
-            and iteration > opt.update_until
         )
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -571,6 +571,7 @@ def render_sets(
             dataset.add_opacity_dist,
             dataset.add_cov_dist,
             dataset.add_color_dist,
+            dataset.use_film_net,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()

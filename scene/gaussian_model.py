@@ -320,6 +320,7 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 use_film_net : bool = False,
                  ):
 
         self.feat_dim = feat_dim
@@ -336,6 +337,7 @@ class GaussianModel:
         self.add_opacity_dist = add_opacity_dist
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
+        self.use_film_net = use_film_net
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -355,7 +357,7 @@ class GaussianModel:
         self.anchor_demon = torch.empty(0)
         self._active_offsets = torch.empty(0)
         self.adaptive_k_enabled = False
-        self.adaptive_k_min = min(4, self.n_offsets)
+        self.adaptive_k_min = min(6, self.n_offsets)
         self.adaptive_k_threshold = 0.0002
         self.adaptive_k_boost = 2.0
         self.adaptive_k_tau_min = 0.0001
@@ -386,9 +388,8 @@ class GaussianModel:
             nn.Linear(feat_dim, n_offsets),
             nn.Tanh()
         ).cuda()
-        # ==================================================================================================
-        self.mlp_opacity = Used_net(feat_dim, 3+self.opacity_dist_dim, n_offsets, activation=nn.Tanh()).cuda()
-        # ==================================================================================================
+        if self.use_film_net:
+            self.mlp_opacity = Used_net(feat_dim, 3+self.opacity_dist_dim, n_offsets, activation=nn.Tanh()).cuda()
 
         self.add_cov_dist = add_cov_dist
         self.cov_dist_dim = 1 if self.add_cov_dist else 0
@@ -397,9 +398,8 @@ class GaussianModel:
             nn.ReLU(True),
             nn.Linear(feat_dim, 7*self.n_offsets),
         ).cuda()
-        # ==================================================================================================
-        self.mlp_cov = Used_net(feat_dim, 3+self.cov_dist_dim, 7*self.n_offsets).cuda()
-        # ==================================================================================================
+        if self.use_film_net:
+            self.mlp_cov = Used_net(feat_dim, 3+self.cov_dist_dim, 7*self.n_offsets).cuda()
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
         self.mlp_color = nn.Sequential(
@@ -408,10 +408,8 @@ class GaussianModel:
             nn.Linear(feat_dim, 3*self.n_offsets),
             nn.Sigmoid()
         ).cuda()
-
-        # ==================================================================================================
-        self.mlp_color = Used_net(feat_dim+self.appearance_dim, 3+self.color_dist_dim, 3*self.n_offsets, activation=nn.Sigmoid()).cuda()
-        # ==================================================================================================
+        if self.use_film_net:
+            self.mlp_color = Used_net(feat_dim+self.appearance_dim, 3+self.color_dist_dim, 3*self.n_offsets, activation=nn.Sigmoid()).cuda()
 
 
 
@@ -592,7 +590,7 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.adaptive_k_enabled = getattr(training_args, "adaptive_k", False)
-        self.adaptive_k_min = max(1, min(getattr(training_args, "adaptive_k_min", 4), self.n_offsets))
+        self.adaptive_k_min = max(1, min(getattr(training_args, "adaptive_k_min", 6), self.n_offsets))
         self.adaptive_k_threshold = getattr(training_args, "adaptive_k_threshold", training_args.densify_grad_threshold)
         self.adaptive_k_boost = getattr(training_args, "adaptive_k_boost", 2.0)
         self.adaptive_k_tau_min = getattr(training_args, "adaptive_k_tau_min", training_args.densify_grad_threshold * 0.5)
@@ -717,15 +715,16 @@ class GaussianModel:
                 lr = self.appearance_scheduler_args(iteration)
                 param_group['lr'] = lr
 
-    def apply_gradient_phase(self, phase):
+    def apply_gradient_phase(self, phase, soft_lr_scale=0.25):
+        soft_lr_scale = max(0.0, min(float(soft_lr_scale), 1.0))
         for param_group in self.optimizer.param_groups:
             name = param_group["name"]
             if phase == "position":
                 if name in {"mlp_color", "mlp_opacity", "opacity", "embedding_appearance"}:
-                    param_group["lr"] = 0.0
+                    param_group["lr"] *= soft_lr_scale
             elif phase == "opacity":
                 if name in {"anchor", "offset"}:
-                    param_group["lr"] = 0.0
+                    param_group["lr"] *= soft_lr_scale
 
 
     def construct_list_of_attributes(self):
@@ -1152,17 +1151,26 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
         if mode == 'split':
             self.mlp_opacity.eval()
-            opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim).cuda(), torch.rand(1, 3+self.opacity_dist_dim).cuda()))
+            if self.use_film_net:
+                opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim).cuda(), torch.rand(1, 3+self.opacity_dist_dim).cuda()))
+            else:
+                opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim+3+self.opacity_dist_dim).cuda(),))
             opacity_mlp.save(os.path.join(path, 'opacity_mlp.pt'))
             self.mlp_opacity.train()
 
             self.mlp_cov.eval()
-            cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, self.feat_dim).cuda(), torch.rand(1, 3+self.cov_dist_dim).cuda()))
+            if self.use_film_net:
+                cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, self.feat_dim).cuda(), torch.rand(1, 3+self.cov_dist_dim).cuda()))
+            else:
+                cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, self.feat_dim+3+self.cov_dist_dim).cuda(),))
             cov_mlp.save(os.path.join(path, 'cov_mlp.pt'))
             self.mlp_cov.train()
 
             self.mlp_color.eval()
-            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim).cuda(), torch.rand(1, 3+self.color_dist_dim+self.appearance_dim).cuda()))
+            if self.use_film_net:
+                color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+self.appearance_dim).cuda(), torch.rand(1, 3+self.color_dist_dim).cuda()))
+            else:
+                color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+3+self.color_dist_dim+self.appearance_dim).cuda(),))
             color_mlp.save(os.path.join(path, 'color_mlp.pt'))
             self.mlp_color.train()
 
