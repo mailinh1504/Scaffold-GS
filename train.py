@@ -178,9 +178,14 @@ def training(
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
-        gradient_phase = get_gradient_phase(iteration, opt)
-        gaussians.apply_gradient_phase(gradient_phase)
-        gaussians.adaptive_k_enabled = opt.adaptive_k and iteration >= opt.adaptive_k_warmup
+        gradient_phase = get_gradient_phase(iteration, opt) if opt.multiphase_gradient else "position"
+        if opt.multiphase_gradient:
+            gaussians.apply_gradient_phase(gradient_phase)
+        gaussians.adaptive_k_enabled = (
+            opt.adaptive_k
+            and iteration >= opt.adaptive_k_warmup
+            and iteration > opt.update_until
+        )
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
