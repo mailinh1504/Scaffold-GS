@@ -160,10 +160,10 @@ class OptimizationParams(ParamGroup):
         self.adaptive_k_tau_min = 0.0001
         self.adaptive_k_tau_max = 0.0006
         self.adaptive_k_use_quantile = True
-        self.adaptive_k_quantile_min = 0.30
-        self.adaptive_k_quantile_max = 0.90
-        self.adaptive_k_score_topk = 3
-        self.adaptive_k_warmup = 10000
+        self.adaptive_k_quantile_min = 0.10
+        self.adaptive_k_quantile_max = 0.70
+        self.adaptive_k_score_topk = 1
+        self.adaptive_k_warmup = 15000
         self.opacity_grad_lambda = 2.0
         self.gradient_phase1_until = 10000
         self.gradient_phase2_until = 20000
