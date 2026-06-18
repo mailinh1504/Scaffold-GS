@@ -165,11 +165,11 @@ class OptimizationParams(ParamGroup):
         self.adaptive_k_quantile_max = 0.70
         self.adaptive_k_score_topk = 1
         self.adaptive_k_warmup = 12000
-        self.opacity_grad_lambda = 2.0
+        self.opacity_grad_lambda = 0.5
         self.multiphase_gradient = True
-        self.multiphase_soft_lr_scale = 0.25
-        self.gradient_phase1_until = 10000
-        self.gradient_phase2_until = 20000
+        self.multiphase_soft_lr_scale = 1.0
+        self.gradient_phase1_until = 15000
+        self.gradient_phase2_until = 22000
 
         # Soft mask culling
         self.soft_culling = False
