@@ -63,15 +63,33 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
-    if pc.adaptive_k_enabled:
-        active_offsets = pc.get_active_offsets(visible_mask).to(neural_opacity.device)
-        offset_ids = torch.arange(pc.n_offsets, device=neural_opacity.device).view(1, -1)
-        adaptive_mask = offset_ids < active_offsets
-        neural_opacity = torch.where(
-            adaptive_mask,
-            neural_opacity,
-            torch.full_like(neural_opacity, -1e6),
-        )
+    if pc.adaptive_k_enabled or pc.soft_culling_enabled:
+        if pc.adaptive_k_enabled:
+            active_offsets = pc.get_active_offsets(visible_mask).to(neural_opacity.device)
+        else:
+            active_offsets = torch.full(
+                (neural_opacity.shape[0], 1),
+                pc.soft_culling_k,
+                dtype=torch.long,
+                device=neural_opacity.device,
+            )
+        sorted_offsets = torch.argsort(neural_opacity.detach(), dim=1, descending=True)
+        offset_ranks = torch.empty_like(sorted_offsets)
+        rank_ids = torch.arange(pc.n_offsets, device=neural_opacity.device).view(1, -1)
+        offset_ranks.scatter_(1, sorted_offsets, rank_ids.expand_as(sorted_offsets))
+        adaptive_mask = offset_ranks < active_offsets
+        if pc.soft_culling_enabled:
+            neural_opacity = torch.where(
+                adaptive_mask,
+                neural_opacity,
+                neural_opacity * pc.soft_culling_alpha,
+            )
+        else:
+            neural_opacity = torch.where(
+                adaptive_mask,
+                neural_opacity,
+                torch.full_like(neural_opacity, -1e6),
+            )
 
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
@@ -133,11 +151,12 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # post-process offsets to get centers for gaussians
     offsets = offsets * scaling_repeat[:,:3]
     xyz = repeat_anchor + offsets
+    neural_gaussian_count = int(xyz.shape[0])
 
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask
+        return xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_gaussian_count
     else:
-        return xyz, color, opacity, scaling, rot
+        return xyz, color, opacity, scaling, rot, neural_gaussian_count
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
     """
@@ -148,9 +167,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_training = pc.get_color_mlp.training
 
     if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_gaussian_count = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
-        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, color, opacity, scaling, rot, neural_gaussian_count = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
 
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -203,12 +222,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
+                "neural_gaussian_count": neural_gaussian_count,
                 }
     else:
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
+                "neural_gaussian_count": neural_gaussian_count,
                 }
 
 

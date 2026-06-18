@@ -75,7 +75,7 @@ class ModelParams(ParamGroup):
         self.add_opacity_dist = False
         self.add_cov_dist = False
         self.add_color_dist = False
-        self.use_film_net = False
+        self.use_film_net = True
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -166,10 +166,15 @@ class OptimizationParams(ParamGroup):
         self.adaptive_k_score_topk = 1
         self.adaptive_k_warmup = 12000
         self.opacity_grad_lambda = 2.0
-        self.multiphase_gradient = False
+        self.multiphase_gradient = True
         self.multiphase_soft_lr_scale = 0.25
         self.gradient_phase1_until = 10000
         self.gradient_phase2_until = 20000
+
+        # Soft mask culling
+        self.soft_culling = False
+        self.soft_culling_k = 6
+        self.soft_culling_alpha = 0.25
 
         super().__init__(parser, "Optimization Parameters")
 

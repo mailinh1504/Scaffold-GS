@@ -367,6 +367,9 @@ class GaussianModel:
         self.adaptive_k_quantile_max = 0.70
         self.adaptive_k_score_topk = 1
         self.opacity_grad_lambda = 2.0
+        self.soft_culling_enabled = False
+        self.soft_culling_k = min(6, self.n_offsets)
+        self.soft_culling_alpha = 0.25
 
         self.optimizer = None
         self.percent_dense = 0
@@ -600,6 +603,9 @@ class GaussianModel:
         self.adaptive_k_quantile_max = getattr(training_args, "adaptive_k_quantile_max", 0.70)
         self.adaptive_k_score_topk = max(1, min(getattr(training_args, "adaptive_k_score_topk", 1), self.n_offsets))
         self.opacity_grad_lambda = getattr(training_args, "opacity_grad_lambda", 2.0)
+        self.soft_culling_enabled = getattr(training_args, "soft_culling", False)
+        self.soft_culling_k = max(1, min(getattr(training_args, "soft_culling_k", 6), self.n_offsets))
+        self.soft_culling_alpha = max(0.0, min(float(getattr(training_args, "soft_culling_alpha", 0.25)), 1.0))
         if self._active_offsets.numel() == 0 or self._active_offsets.shape[0] != self.get_anchor.shape[0]:
             self._active_offsets = torch.full((self.get_anchor.shape[0], 1), self.n_offsets, dtype=torch.long, device="cuda")
 

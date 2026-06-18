@@ -129,6 +129,39 @@ def training(
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
+    if logger is not None:
+        logger.info(
+            "Ideas enabled: adaptive_k={} multiphase_gradient={} soft_culling={} use_film_net={}".format(
+                opt.adaptive_k,
+                opt.multiphase_gradient,
+                opt.soft_culling,
+                getattr(dataset, "use_film_net", False),
+            )
+        )
+        logger.info(
+            "Multiphase schedule: position<= {} opacity<= {} combined> {}; soft_lr_scale={}".format(
+                opt.gradient_phase1_until,
+                opt.gradient_phase2_until,
+                opt.gradient_phase2_until,
+                opt.multiphase_soft_lr_scale,
+            )
+        )
+        logger.info(
+            "Adaptive-K: min={} warmup={} quantile=({}, {}) topk={}".format(
+                opt.adaptive_k_min,
+                opt.adaptive_k_warmup,
+                opt.adaptive_k_quantile_min,
+                opt.adaptive_k_quantile_max,
+                opt.adaptive_k_score_topk,
+            )
+        )
+        logger.info(
+            "Soft culling: enabled={} fixed_k={} alpha={}".format(
+                opt.soft_culling,
+                opt.soft_culling_k,
+                opt.soft_culling_alpha,
+            )
+        )
 
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -141,6 +174,7 @@ def training(
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    training_time_start = time.time()
     for iteration in range(first_iter, opt.iterations + 1):
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -314,6 +348,18 @@ def training(
                     scene.model_path + "/chkpnt" + str(iteration) + ".pth",
                 )
 
+    training_time_sec = time.time() - training_time_start
+    if logger is not None:
+        logger.info(
+            "Training time: \033[1;35m{:.2f} sec ({:.2f} min)\033[0m".format(
+                training_time_sec, training_time_sec / 60.0
+            )
+        )
+    if tb_writer:
+        tb_writer.add_scalar(f"{dataset_name}/training_time_sec", training_time_sec, opt.iterations)
+    if wandb is not None:
+        wandb.log({"training_time_sec": training_time_sec})
+
 
 def prepare_output_and_logger(args):
     if not args.model_path:
@@ -336,6 +382,40 @@ def prepare_output_and_logger(args):
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
+
+
+def get_path_size_mb(path):
+    if not path or not os.path.exists(path):
+        return 0.0
+    if os.path.isfile(path):
+        return os.path.getsize(path) / (1024.0 * 1024.0)
+
+    total_size = 0
+    for root, _, files in os.walk(path):
+        for fname in files:
+            total_size += os.path.getsize(os.path.join(root, fname))
+    return total_size / (1024.0 * 1024.0)
+
+
+def get_model_size_mb(model_path, iteration):
+    point_cloud_dir = os.path.join(
+        model_path, "point_cloud", "iteration_{}".format(iteration)
+    )
+    return get_path_size_mb(point_cloud_dir)
+
+
+def apply_render_options(gaussians, opt):
+    if opt is None:
+        return
+
+    gaussians.adaptive_k_enabled = getattr(opt, "adaptive_k", gaussians.adaptive_k_enabled)
+    gaussians.soft_culling_enabled = getattr(opt, "soft_culling", False)
+    gaussians.soft_culling_k = max(
+        1, min(getattr(opt, "soft_culling_k", gaussians.n_offsets), gaussians.n_offsets)
+    )
+    gaussians.soft_culling_alpha = max(
+        0.0, min(float(getattr(opt, "soft_culling_alpha", 0.25)), 1.0)
+    )
 
 
 def training_report(
@@ -497,8 +577,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     t_list = []
     visible_count_list = []
+    neural_gaussian_count_list = []
     name_list = []
     per_view_dict = {}
+    neural_gaussian_per_view_dict = {}
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         torch.cuda.synchronize()
         t_start = time.time()
@@ -515,7 +597,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # renders
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = (render_pkg["radii"] > 0).sum()
+        neural_gaussian_count = render_pkg["neural_gaussian_count"]
         visible_count_list.append(visible_count)
+        neural_gaussian_count_list.append(neural_gaussian_count)
 
         # gts
         gt = view.original_image[0:3, :, :]
@@ -533,7 +617,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(
             gt, os.path.join(gts_path, "{0:05d}".format(idx) + ".png")
         )
-        per_view_dict["{0:05d}".format(idx) + ".png"] = visible_count.item()
+        image_name = "{0:05d}".format(idx) + ".png"
+        per_view_dict[image_name] = visible_count.item()
+        neural_gaussian_per_view_dict[image_name] = neural_gaussian_count
 
     with open(
         os.path.join(
@@ -543,13 +629,22 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     ) as fp:
         json.dump(per_view_dict, fp, indent=True)
 
-    return t_list, visible_count_list
+    with open(
+        os.path.join(
+            model_path, name, "ours_{}".format(iteration), "per_view_neural_gaussian_count.json"
+        ),
+        "w",
+    ) as fp:
+        json.dump(neural_gaussian_per_view_dict, fp, indent=True)
+
+    return t_list, visible_count_list, neural_gaussian_count_list
 
 
 def render_sets(
     dataset: ModelParams,
     iteration: int,
     pipeline: PipelineParams,
+    opt=None,
     skip_train=True,
     skip_test=False,
     wandb=None,
@@ -574,6 +669,7 @@ def render_sets(
             dataset.use_film_net,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        apply_render_options(gaussians, opt)
         gaussians.eval()
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -581,8 +677,14 @@ def render_sets(
         if not os.path.exists(dataset.model_path):
             os.makedirs(dataset.model_path)
 
+        metrics = {
+            "model_size_mb": get_model_size_mb(dataset.model_path, scene.loaded_iter),
+            "visible_count": None,
+            "neural_gaussian_count": None,
+        }
+
         if not skip_train:
-            t_train_list, visible_count = render_set(
+            t_train_list, train_visible_count, train_neural_gaussian_count = render_set(
                 dataset.model_path,
                 "train",
                 scene.loaded_iter,
@@ -593,15 +695,23 @@ def render_sets(
             )
             train_fps = 1.0 / torch.tensor(t_train_list[5:]).mean()
             logger.info(f"Train FPS: \033[1;35m{train_fps.item():.5f}\033[0m")
+            logger.info(
+                "Train neural Gaussians/view: \033[1;35m{:.2f}\033[0m".format(
+                    torch.tensor(train_neural_gaussian_count, dtype=torch.float32).mean().item()
+                )
+            )
             if wandb is not None:
                 wandb.log(
                     {
                         "train_fps": train_fps.item(),
+                        "train_neural_gaussians_per_view": torch.tensor(
+                            train_neural_gaussian_count, dtype=torch.float32
+                        ).mean().item(),
                     }
                 )
 
         if not skip_test:
-            t_test_list, visible_count = render_set(
+            t_test_list, test_visible_count, test_neural_gaussian_count = render_set(
                 dataset.model_path,
                 "test",
                 scene.loaded_iter,
@@ -612,16 +722,42 @@ def render_sets(
             )
             test_fps = 1.0 / torch.tensor(t_test_list[5:]).mean()
             logger.info(f"Test FPS: \033[1;35m{test_fps.item():.5f}\033[0m")
+            logger.info(
+                "Test neural Gaussians/view: \033[1;35m{:.2f}\033[0m".format(
+                    torch.tensor(test_neural_gaussian_count, dtype=torch.float32).mean().item()
+                )
+            )
+            logger.info(
+                "Model size: \033[1;35m{:.3f} MB\033[0m".format(
+                    metrics["model_size_mb"]
+                )
+            )
+            metrics["visible_count"] = test_visible_count
+            metrics["neural_gaussian_count"] = test_neural_gaussian_count
             if tb_writer:
                 tb_writer.add_scalar(f"{dataset_name}/test_FPS", test_fps.item(), 0)
+                tb_writer.add_scalar(
+                    f"{dataset_name}/test_neural_gaussians_per_view",
+                    torch.tensor(test_neural_gaussian_count, dtype=torch.float32).mean().item(),
+                    0,
+                )
+                tb_writer.add_scalar(
+                    f"{dataset_name}/model_size_mb",
+                    metrics["model_size_mb"],
+                    0,
+                )
             if wandb is not None:
                 wandb.log(
                     {
                         "test_fps": test_fps,
+                        "test_neural_gaussians_per_view": torch.tensor(
+                            test_neural_gaussian_count, dtype=torch.float32
+                        ).mean().item(),
+                        "model_size_mb": metrics["model_size_mb"],
                     }
                 )
 
-    return visible_count
+    return metrics
 
 
 def readImages(renders_dir, gt_dir):
@@ -639,12 +775,17 @@ def readImages(renders_dir, gt_dir):
 
 def evaluate(
     model_paths,
-    visible_count=None,
+    render_metrics=None,
     wandb=None,
     tb_writer=None,
     dataset_name=None,
     logger=None,
 ):
+    render_metrics = render_metrics or {}
+    visible_count = render_metrics.get("visible_count")
+    neural_gaussian_count = render_metrics.get("neural_gaussian_count")
+    model_size_mb = render_metrics.get("model_size_mb", 0.0)
+
     full_dict = {}
     per_view_dict = {}
     full_dict_polytopeonly = {}
@@ -712,6 +853,13 @@ def evaluate(
                 torch.tensor(lpipss).mean(), ".5"
             )
         )
+        if neural_gaussian_count is not None:
+            logger.info(
+                "  Neural Gaussians/view: \033[1;35m{:>12.2f}\033[0m".format(
+                    torch.tensor(neural_gaussian_count, dtype=torch.float32).mean().item()
+                )
+            )
+        logger.info("  Model Size: \033[1;35m{:>12.3f} MB\033[0m".format(model_size_mb))
         print("")
 
         if tb_writer:
@@ -725,41 +873,54 @@ def evaluate(
                 f"{dataset_name}/LPIPS", torch.tensor(lpipss).mean().item(), 0
             )
 
-            tb_writer.add_scalar(
-                f"{dataset_name}/VISIBLE_NUMS",
-                torch.tensor(visible_count).mean().item(),
-                0,
-            )
+            if visible_count is not None:
+                tb_writer.add_scalar(
+                    f"{dataset_name}/VISIBLE_NUMS",
+                    torch.tensor(visible_count).mean().item(),
+                    0,
+                )
+            if neural_gaussian_count is not None:
+                tb_writer.add_scalar(
+                    f"{dataset_name}/NEURAL_GAUSSIANS",
+                    torch.tensor(neural_gaussian_count, dtype=torch.float32).mean().item(),
+                    0,
+                )
+            tb_writer.add_scalar(f"{dataset_name}/MODEL_SIZE_MB", model_size_mb, 0)
 
         full_dict[scene_dir][method].update(
             {
                 "SSIM": torch.tensor(ssims).mean().item(),
                 "PSNR": torch.tensor(psnrs).mean().item(),
                 "LPIPS": torch.tensor(lpipss).mean().item(),
+                "NEURAL_GAUSSIANS_PER_VIEW": None if neural_gaussian_count is None else torch.tensor(neural_gaussian_count, dtype=torch.float32).mean().item(),
+                "MODEL_SIZE_MB": model_size_mb,
             }
         )
-        per_view_dict[scene_dir][method].update(
-            {
-                "SSIM": {
-                    name: ssim
-                    for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)
-                },
-                "PSNR": {
-                    name: psnr
-                    for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)
-                },
-                "LPIPS": {
-                    name: lp
-                    for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)
-                },
-                "VISIBLE_COUNT": {
-                    name: vc
-                    for vc, name in zip(
-                        torch.tensor(visible_count).tolist(), image_names
-                    )
-                },
+        per_view_metrics = {
+            "SSIM": {
+                name: ssim
+                for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)
+            },
+            "PSNR": {
+                name: psnr
+                for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)
+            },
+            "LPIPS": {
+                name: lp
+                for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)
+            },
+        }
+        if visible_count is not None:
+            per_view_metrics["VISIBLE_COUNT"] = {
+                name: vc
+                for vc, name in zip(torch.tensor(visible_count).tolist(), image_names)
             }
-        )
+        if neural_gaussian_count is not None:
+            per_view_metrics["NEURAL_GAUSSIAN_COUNT"] = {
+                name: int(count)
+                for count, name in zip(neural_gaussian_count, image_names)
+            }
+        per_view_dict[scene_dir][method].update(per_view_metrics)
 
     with open(scene_dir + "/results.json", "w") as fp:
         json.dump(full_dict[scene_dir], fp, indent=True)
@@ -894,12 +1055,12 @@ if __name__ == "__main__":
 
     # rendering
     logger.info(f"\nStarting Rendering~")
-    visible_count = render_sets(
-        lp.extract(args), -1, pp.extract(args), wandb=wandb, logger=logger
+    render_metrics = render_sets(
+        lp.extract(args), -1, pp.extract(args), opt=op.extract(args), wandb=wandb, logger=logger
     )
     logger.info("\nRendering complete.")
 
     # calc metrics
     logger.info("\n Starting evaluation...")
-    evaluate(args.model_path, visible_count=visible_count, wandb=wandb, logger=logger)
+    evaluate(args.model_path, render_metrics=render_metrics, wandb=wandb, logger=logger)
     logger.info("\nEvaluating complete.")
