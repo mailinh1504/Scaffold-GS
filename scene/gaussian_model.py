@@ -886,12 +886,12 @@ class GaussianModel:
             opacity_grad = opacity_grad_visible[offset_selection_mask][update_filter]
 
         opacity_weight = opacity_grad / opacity_grad.detach().mean().clamp_min(1e-12)
-        opacity_weight = opacity_weight.clamp(0.0, 4.0)
+        opacity_weight = opacity_weight.clamp(0.0, 2.0)
 
         if gradient_phase == "opacity":
             grad_score = position_grad * (1.0 + self.opacity_grad_lambda * opacity_weight)
         elif gradient_phase == "combined":
-            grad_score = position_grad * (1.0 + 0.5 * self.opacity_grad_lambda * opacity_weight)
+            grad_score = position_grad * (1.0 + 0.25 * self.opacity_grad_lambda * opacity_weight)
         else:
             grad_score = position_grad
 
