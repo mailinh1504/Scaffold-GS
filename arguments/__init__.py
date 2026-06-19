@@ -152,6 +152,11 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # Soft Culling for FiLM neural Gaussians
+        self.soft_culling = True
+        self.soft_culling_k = 6
+        self.soft_culling_alpha = 0.25
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

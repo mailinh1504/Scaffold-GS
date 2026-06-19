@@ -61,6 +61,19 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         # neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
         neural_opacity = pc.get_opacity_mlp(feat, ob_view)
 
+    if pc.soft_culling_enabled:
+        topk = min(pc.soft_culling_k, pc.n_offsets)
+        sorted_offsets = torch.argsort(neural_opacity.detach(), dim=1, descending=True)
+        offset_ranks = torch.empty_like(sorted_offsets)
+        rank_ids = torch.arange(pc.n_offsets, device=neural_opacity.device).view(1, -1)
+        offset_ranks.scatter_(1, sorted_offsets, rank_ids.expand_as(sorted_offsets))
+        keep_mask = offset_ranks < topk
+        neural_opacity = torch.where(
+            keep_mask,
+            neural_opacity,
+            neural_opacity * pc.soft_culling_alpha,
+        )
+
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
     mask = (neural_opacity>0.0)

@@ -352,6 +352,9 @@ class GaussianModel:
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+        self.soft_culling_enabled = True
+        self.soft_culling_k = min(6, self.n_offsets)
+        self.soft_culling_alpha = 0.25
 
         self.optimizer = None
         self.percent_dense = 0
@@ -548,6 +551,9 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.soft_culling_enabled = getattr(training_args, "soft_culling", True)
+        self.soft_culling_k = max(1, min(getattr(training_args, "soft_culling_k", 6), self.n_offsets))
+        self.soft_culling_alpha = max(0.0, min(float(getattr(training_args, "soft_culling_alpha", 0.25)), 1.0))
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
