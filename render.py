@@ -31,6 +31,21 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 
+def get_path_size_mb(path):
+    if not path or not os.path.exists(path):
+        return 0.0
+    if os.path.isfile(path):
+        return os.path.getsize(path) / (1024.0 * 1024.0)
+
+    total_size = 0
+    for root, _, files in os.walk(path):
+        for fname in files:
+            total_size += os.path.getsize(os.path.join(root, fname))
+    return total_size / (1024.0 * 1024.0)
+
+def get_model_size_mb(model_path, iteration):
+    return get_path_size_mb(os.path.join(model_path, "point_cloud", "iteration_{}".format(iteration)))
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -43,6 +58,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     per_view_dict = {}
     # debug = 0
     t_list = []
+    neural_gaussian_count_list = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
 
         torch.cuda.synchronize(); t0 = time.time()
@@ -51,19 +67,26 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torch.cuda.synchronize(); t1 = time.time()
         
         t_list.append(t1-t0)
+        neural_gaussian_count_list.append(render_pkg["neural_gaussian_count"])
 
         rendering = render_pkg["render"]
         gt = view.original_image[0:3, :, :]
-        name_list.append('{0:05d}'.format(idx) + ".png")
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        image_name = '{0:05d}'.format(idx) + ".png"
+        name_list.append(image_name)
+        per_view_dict[image_name] = int((render_pkg["radii"] > 0).sum().item())
+        torchvision.utils.save_image(rendering, os.path.join(render_path, image_name))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, image_name))
 
     t = np.array(t_list[5:])
     fps = 1.0 / t.mean()
     print(f'Test FPS: \033[1;35m{fps:.5f}\033[0m')
+    print(f'Neural Gaussians/view: \033[1;35m{np.mean(neural_gaussian_count_list):.2f}\033[0m')
 
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)      
+
+    with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_neural_gaussian_count.json"), 'w') as fp:
+            json.dump({name: count for name, count in zip(name_list, neural_gaussian_count_list)}, fp, indent=True)
      
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
@@ -77,6 +100,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         if not os.path.exists(dataset.model_path):
             os.makedirs(dataset.model_path)
+
+        print(f'Model size: \033[1;35m{get_model_size_mb(dataset.model_path, scene.loaded_iter):.3f} MB\033[0m')
         
         if not skip_train:
              render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
