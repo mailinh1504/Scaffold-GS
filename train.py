@@ -118,6 +118,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        gaussians.adaptive_k_enabled = opt.adaptive_k and iteration >= opt.adaptive_k_warmup
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

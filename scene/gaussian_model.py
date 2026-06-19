@@ -352,6 +352,14 @@ class GaussianModel:
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+        self._active_offsets = torch.empty(0)
+        self.adaptive_k_enabled = False
+        self.adaptive_k_min = min(6, self.n_offsets)
+        self.adaptive_k_warmup = 12000
+        self.adaptive_k_use_quantile = True
+        self.adaptive_k_quantile_min = 0.10
+        self.adaptive_k_quantile_max = 0.70
+        self.adaptive_k_score_topk = 1
 
         self.optimizer = None
         self.percent_dense = 0
@@ -486,6 +494,15 @@ class GaussianModel:
     def get_anchor(self):
         return self._anchor
 
+    def get_active_offsets(self, visible_mask=None):
+        if self._active_offsets.numel() == 0 or self._active_offsets.shape[0] != self.get_anchor.shape[0]:
+            count = self.get_anchor.shape[0] if visible_mask is None else int(visible_mask.sum().item())
+            return torch.full((count, 1), self.n_offsets, dtype=torch.long, device=self.get_anchor.device)
+        active_offsets = self._active_offsets
+        if visible_mask is not None:
+            active_offsets = active_offsets[visible_mask]
+        return active_offsets.clamp(1, self.n_offsets)
+
     @property
     def set_anchor(self, new_anchor):
         assert self._anchor.shape == new_anchor.shape
@@ -544,10 +561,20 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self._active_offsets = torch.full((self.get_anchor.shape[0], 1), self.n_offsets, dtype=torch.long, device="cuda")
 
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.adaptive_k_enabled = getattr(training_args, "adaptive_k", False)
+        self.adaptive_k_min = max(1, min(getattr(training_args, "adaptive_k_min", 6), self.n_offsets))
+        self.adaptive_k_warmup = getattr(training_args, "adaptive_k_warmup", 12000)
+        self.adaptive_k_use_quantile = getattr(training_args, "adaptive_k_use_quantile", True)
+        self.adaptive_k_quantile_min = getattr(training_args, "adaptive_k_quantile_min", 0.10)
+        self.adaptive_k_quantile_max = getattr(training_args, "adaptive_k_quantile_max", 0.70)
+        self.adaptive_k_score_topk = max(1, min(getattr(training_args, "adaptive_k_score_topk", 1), self.n_offsets))
+        if self._active_offsets.numel() == 0 or self._active_offsets.shape[0] != self.get_anchor.shape[0]:
+            self._active_offsets = torch.full((self.get_anchor.shape[0], 1), self.n_offsets, dtype=torch.long, device="cuda")
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
@@ -668,6 +695,7 @@ class GaussianModel:
         for i in range(self._anchor_feat.shape[1]):
             l.append('f_anchor_feat_{}'.format(i))
         l.append('opacity')
+        l.append('active_offsets')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -682,13 +710,14 @@ class GaussianModel:
         anchor_feat = self._anchor_feat.detach().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
+        active_offsets = self.get_active_offsets().float().detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, active_offsets, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -700,6 +729,12 @@ class GaussianModel:
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1).astype(np.float32)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis].astype(np.float32)
+        ply_property_names = [p.name for p in plydata.elements[0].properties]
+        if "active_offsets" in ply_property_names:
+            active_offsets = np.asarray(plydata.elements[0]["active_offsets"])[..., np.newaxis].astype(np.int64)
+            self.adaptive_k_enabled = True
+        else:
+            active_offsets = np.full((anchor.shape[0], 1), self.n_offsets, dtype=np.int64)
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
@@ -734,6 +769,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._active_offsets = torch.tensor(active_offsets, dtype=torch.long, device="cuda").clamp(1, self.n_offsets)
 
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -940,6 +976,9 @@ class GaussianModel:
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
 
+                new_active_offsets = torch.full((new_opacities.shape[0], 1), self.n_offsets, dtype=torch.long, device='cuda')
+                self._active_offsets = torch.cat([self.get_active_offsets(), new_active_offsets], dim=0)
+
                 torch.cuda.empty_cache()
 
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -959,6 +998,7 @@ class GaussianModel:
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
 
+        self.update_active_offsets()
         self.anchor_growing(grads_norm, grad_threshold, offset_mask)
 
         # update offset_denom
@@ -1003,10 +1043,44 @@ class GaussianModel:
         del self.anchor_demon
         self.anchor_demon = temp_anchor_demon
 
+        self._active_offsets = self.get_active_offsets()[~prune_mask]
+
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
 
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+
+    def update_active_offsets(self):
+        if not self.adaptive_k_enabled or self.offset_denom.numel() == 0:
+            self._active_offsets = torch.full((self.get_anchor.shape[0], 1), self.n_offsets, dtype=torch.long, device="cuda")
+            return
+
+        grads = self.offset_gradient_accum / self.offset_denom.clamp_min(1.0)
+        grads[grads.isnan()] = 0.0
+        anchor_grads = grads.view([-1, self.n_offsets])
+        topk = min(self.adaptive_k_score_topk, self.n_offsets)
+        anchor_scores = anchor_grads.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
+
+        anchor_seen = self.offset_denom.view([-1, self.n_offsets]).sum(dim=1, keepdim=True) > 0
+        if self.adaptive_k_use_quantile:
+            valid_scores = anchor_scores.detach().view(-1)[anchor_seen.view(-1)]
+            if valid_scores.numel() > 1:
+                q_min = min(self.adaptive_k_quantile_min, self.adaptive_k_quantile_max)
+                q_max = max(self.adaptive_k_quantile_min, self.adaptive_k_quantile_max)
+                tau_min = torch.quantile(valid_scores, q_min)
+                tau_max = torch.quantile(valid_scores, q_max)
+            else:
+                tau_min = anchor_scores.new_tensor(0.0)
+                tau_max = anchor_scores.new_tensor(1.0)
+        else:
+            tau_min = anchor_scores.detach().min()
+            tau_max = anchor_scores.detach().max()
+
+        relative = ((anchor_scores - tau_min) / (tau_max - tau_min).clamp_min(1e-12)).clamp(0.0, 1.0)
+        active_offsets = self.adaptive_k_min + torch.ceil(relative * (self.n_offsets - self.adaptive_k_min)).long()
+        active_offsets = active_offsets.clamp(self.adaptive_k_min, self.n_offsets)
+        active_offsets = torch.where(anchor_seen, active_offsets, torch.full_like(active_offsets, self.n_offsets))
+        self._active_offsets = active_offsets
 
     def save_mlp_checkpoints(self, path, mode = 'unite'):#split or unite
         mkdir_p(os.path.dirname(path))

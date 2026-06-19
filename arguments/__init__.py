@@ -152,6 +152,15 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # Adaptive-K Neural Gaussian
+        self.adaptive_k = True
+        self.adaptive_k_min = 6
+        self.adaptive_k_warmup = 12000
+        self.adaptive_k_use_quantile = True
+        self.adaptive_k_quantile_min = 0.10
+        self.adaptive_k_quantile_max = 0.70
+        self.adaptive_k_score_topk = 1
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
