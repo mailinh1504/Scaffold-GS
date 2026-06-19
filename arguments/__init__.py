@@ -154,7 +154,7 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
 
         # Adaptive-K Scaffold-GS
-        self.adaptive_k = False
+        self.adaptive_k = True
         self.adaptive_k_min = 6
         self.adaptive_k_threshold = 0.0002
         self.adaptive_k_boost = 2.0
@@ -172,7 +172,7 @@ class OptimizationParams(ParamGroup):
         self.gradient_phase2_until = 12000
 
         # Soft mask culling
-        self.soft_culling = False
+        self.soft_culling = True
         self.soft_culling_k = 6
         self.soft_culling_alpha = 0.25
 
