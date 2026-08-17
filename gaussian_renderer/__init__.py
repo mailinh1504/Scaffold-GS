@@ -63,34 +63,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
-    if pc.adaptive_k_enabled or pc.soft_culling_enabled:
-        if pc.adaptive_k_enabled:
-            active_offsets = pc.get_active_offsets(visible_mask).to(neural_opacity.device)
-        else:
-            active_offsets = torch.full(
-                (neural_opacity.shape[0], 1),
-                pc.soft_culling_k,
-                dtype=torch.long,
-                device=neural_opacity.device,
-            )
-        sorted_offsets = torch.argsort(neural_opacity.detach(), dim=1, descending=True)
-        offset_ranks = torch.empty_like(sorted_offsets)
-        rank_ids = torch.arange(pc.n_offsets, device=neural_opacity.device).view(1, -1)
-        offset_ranks.scatter_(1, sorted_offsets, rank_ids.expand_as(sorted_offsets))
-        adaptive_mask = offset_ranks < active_offsets
-        if pc.soft_culling_enabled:
-            neural_opacity = torch.where(
-                adaptive_mask,
-                neural_opacity,
-                neural_opacity * pc.soft_culling_alpha,
-            )
-        else:
-            neural_opacity = torch.where(
-                adaptive_mask,
-                neural_opacity,
-                torch.full_like(neural_opacity, -1e6),
-            )
-
+    # FiLM-MP change: keep the original Scaffold-GS offset selection.
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
     if is_training:

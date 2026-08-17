@@ -88,12 +88,38 @@ def saveRuntimeCode(dst: str) -> None:
     print("Backup Finished!")
 
 
-def get_gradient_phase(iteration, opt):
-    if iteration <= opt.gradient_phase1_until:
-        return "position"
-    if iteration <= opt.gradient_phase2_until:
-        return "opacity"
-    return "combined"
+# FiLM-MP change: these helpers control when Scaffold-GS is allowed
+# to collect densification stats and grow new anchors.
+def mp_enabled(opt):
+    return getattr(opt, "mp_growing", False)
+
+
+def in_stats_window(iteration, opt):
+    if mp_enabled(opt):
+        # MP only collects grow statistics in the middle phase.
+        return opt.mp_warmup_until < iteration <= opt.mp_growing_until
+    return iteration < opt.update_until and iteration > opt.start_stat
+
+
+def grow_now(iteration, opt):
+    if mp_enabled(opt):
+        # Grow after one full stat interval so warm-up gradients are not reused.
+        first_grow_iter = opt.mp_warmup_until + opt.update_interval
+        return (
+            first_grow_iter <= iteration <= opt.mp_growing_until
+            and iteration % opt.update_interval == 0
+        )
+    return (
+        iteration > opt.update_from
+        and iteration % opt.update_interval == 0
+    )
+
+
+def stats_expired(iteration, opt):
+    if mp_enabled(opt):
+        # After the growing phase, training continues but anchors stay fixed.
+        return iteration > opt.mp_growing_until
+    return iteration == opt.update_until
 
 
 def training(
@@ -131,35 +157,16 @@ def training(
     gaussians.training_setup(opt)
     if logger is not None:
         logger.info(
-            "Ideas enabled: adaptive_k={} multiphase_gradient={} soft_culling={} use_film_net={}".format(
-                opt.adaptive_k,
-                opt.multiphase_gradient,
-                opt.soft_culling,
+            "Ideas enabled: mp_growing={} use_film_net={}".format(
+                getattr(opt, "mp_growing", False),
                 getattr(dataset, "use_film_net", False),
             )
         )
         logger.info(
-            "Multiphase schedule: position<= {} opacity<= {} combined> {}; soft_lr_scale={}".format(
-                opt.gradient_phase1_until,
-                opt.gradient_phase2_until,
-                opt.gradient_phase2_until,
-                opt.multiphase_soft_lr_scale,
-            )
-        )
-        logger.info(
-            "Adaptive-K: min={} warmup={} quantile=({}, {}) topk={}".format(
-                opt.adaptive_k_min,
-                opt.adaptive_k_warmup,
-                opt.adaptive_k_quantile_min,
-                opt.adaptive_k_quantile_max,
-                opt.adaptive_k_score_topk,
-            )
-        )
-        logger.info(
-            "Soft culling: enabled={} fixed_k={} alpha={}".format(
-                opt.soft_culling,
-                opt.soft_culling_k,
-                opt.soft_culling_alpha,
+            "FiLM-MP growing schedule: warmup<= {} grow<= {} refinement> {}; metric=position_grad".format(
+                getattr(opt, "mp_warmup_until", opt.start_stat),
+                getattr(opt, "mp_growing_until", opt.update_until),
+                getattr(opt, "mp_growing_until", opt.update_until),
             )
         )
 
@@ -175,6 +182,8 @@ def training(
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     training_time_start = time.time()
+    stats_reset = not mp_enabled(opt)
+    stats_freed = False
     for iteration in range(first_iter, opt.iterations + 1):
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -213,13 +222,14 @@ def training(
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
-        gradient_phase = get_gradient_phase(iteration, opt) if opt.multiphase_gradient else "position"
-        if opt.multiphase_gradient:
-            gaussians.apply_gradient_phase(gradient_phase, opt.multiphase_soft_lr_scale)
-        gaussians.adaptive_k_enabled = (
-            opt.adaptive_k
-            and iteration >= opt.adaptive_k_warmup
-        )
+        # FiLM-MP change: discard warm-up stats before the growing phase starts.
+        if mp_enabled(opt) and not stats_reset and iteration > opt.mp_warmup_until:
+            gaussians.reset_densification_stats()
+            stats_reset = True
+            if logger is not None:
+                logger.info(
+                    "\n[ITER {}] Reset densification stats before FiLM-MP growing".format(iteration)
+                )
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -234,7 +244,9 @@ def training(
             pipe.debug = True
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
-        retain_grad = iteration < opt.update_until and iteration >= 0
+        stats_on = in_stats_window(iteration, opt)
+        # FiLM-MP change: retain 2D gradients only while densification is active.
+        retain_grad = stats_on
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -310,31 +322,32 @@ def training(
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # densification
-            if iteration < opt.update_until and iteration > opt.start_stat:
-                # add statis
+            # FiLM-MP change: densification runs only inside the selected window.
+            if stats_on:
+                # Accumulate Scaffold-GS densification statistics.
                 gaussians.training_statis(
                     viewspace_point_tensor,
                     opacity,
                     visibility_filter,
                     offset_selection_mask,
                     voxel_visible_mask,
-                    gradient_phase=gradient_phase,
                 )
 
-                # densification
-                if iteration > opt.update_from and iteration % opt.update_interval == 0:
+                # Grow anchors only at the scheduled update interval.
+                if grow_now(iteration, opt):
                     gaussians.adjust_anchor(
                         check_interval=opt.update_interval,
                         success_threshold=opt.success_threshold,
                         grad_threshold=opt.densify_grad_threshold,
                         min_opacity=opt.min_opacity,
                     )
-            elif iteration == opt.update_until:
-                del gaussians.opacity_accum
-                del gaussians.offset_gradient_accum
-                del gaussians.opacity_gradient_accum
-                del gaussians.offset_denom
+            elif (
+                not stats_freed
+                and stats_expired(iteration, opt)
+            ):
+                # FiLM-MP change: free densification buffers during refinement.
+                gaussians.release_densification_stats()
+                stats_freed = True
                 torch.cuda.empty_cache()
 
             # Optimizer step
@@ -405,17 +418,7 @@ def get_model_size_mb(model_path, iteration):
 
 
 def apply_render_options(gaussians, opt):
-    if opt is None:
-        return
-
-    gaussians.adaptive_k_enabled = getattr(opt, "adaptive_k", gaussians.adaptive_k_enabled)
-    gaussians.soft_culling_enabled = getattr(opt, "soft_culling", False)
-    gaussians.soft_culling_k = max(
-        1, min(getattr(opt, "soft_culling_k", gaussians.n_offsets), gaussians.n_offsets)
-    )
-    gaussians.soft_culling_alpha = max(
-        0.0, min(float(getattr(opt, "soft_culling_alpha", 0.25)), 1.0)
-    )
+    return
 
 
 def training_report(

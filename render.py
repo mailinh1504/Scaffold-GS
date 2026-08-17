@@ -51,14 +51,9 @@ def get_model_size_mb(model_path, iteration):
 
 
 def apply_render_options(gaussians, opt):
-    gaussians.adaptive_k_enabled = getattr(opt, "adaptive_k", gaussians.adaptive_k_enabled)
-    gaussians.soft_culling_enabled = getattr(opt, "soft_culling", False)
-    gaussians.soft_culling_k = max(
-        1, min(getattr(opt, "soft_culling_k", gaussians.n_offsets), gaussians.n_offsets)
-    )
-    gaussians.soft_culling_alpha = max(
-        0.0, min(float(getattr(opt, "soft_culling_alpha", 0.25)), 1.0)
-    )
+    # FiLM-MP change: no extra render-time options are needed after removing
+    # adaptive-k and soft-culling from this branch.
+    return
 
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):

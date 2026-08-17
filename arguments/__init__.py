@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, BooleanOptionalAction, Namespace
 import sys
 import os
 
@@ -28,12 +28,16 @@ class ParamGroup:
             value = value if not fill_none else None
             if shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    # FiLM-MP change: allow default-True flags to be disabled,
+                    # e.g. --no-mp_growing for the FiLM baseline.
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action=BooleanOptionalAction)
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    # FiLM-MP change: allow default-True flags to be disabled,
+                    # e.g. --no-mp_growing for the FiLM baseline.
+                    group.add_argument("--" + key, default=value, action=BooleanOptionalAction)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -93,16 +97,16 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        self.iterations = 50_000
         self.position_lr_init = 0.0
         self.position_lr_final = 0.0
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
+        self.position_lr_max_steps = 50_000
 
         self.offset_lr_init = 0.01
         self.offset_lr_final = 0.0001
         self.offset_lr_delay_mult = 0.01
-        self.offset_lr_max_steps = 30_000
+        self.offset_lr_max_steps = 50_000
 
         self.feature_lr = 0.0075
         self.opacity_lr = 0.02
@@ -113,68 +117,54 @@ class OptimizationParams(ParamGroup):
         self.mlp_opacity_lr_init = 0.002
         self.mlp_opacity_lr_final = 0.00002
         self.mlp_opacity_lr_delay_mult = 0.01
-        self.mlp_opacity_lr_max_steps = 30_000
+        self.mlp_opacity_lr_max_steps = 50_000
 
         self.mlp_cov_lr_init = 0.004
         self.mlp_cov_lr_final = 0.004
         self.mlp_cov_lr_delay_mult = 0.01
-        self.mlp_cov_lr_max_steps = 30_000
+        self.mlp_cov_lr_max_steps = 50_000
 
         self.mlp_color_lr_init = 0.008
         self.mlp_color_lr_final = 0.00005
         self.mlp_color_lr_delay_mult = 0.01
-        self.mlp_color_lr_max_steps = 30_000
+        self.mlp_color_lr_max_steps = 50_000
 
         self.mlp_color_lr_init = 0.008
         self.mlp_color_lr_final = 0.00005
         self.mlp_color_lr_delay_mult = 0.01
-        self.mlp_color_lr_max_steps = 30_000
+        self.mlp_color_lr_max_steps = 50_000
 
         self.mlp_featurebank_lr_init = 0.01
         self.mlp_featurebank_lr_final = 0.00001
         self.mlp_featurebank_lr_delay_mult = 0.01
-        self.mlp_featurebank_lr_max_steps = 30_000
+        self.mlp_featurebank_lr_max_steps = 50_000
 
         self.appearance_lr_init = 0.05
         self.appearance_lr_final = 0.0005
         self.appearance_lr_delay_mult = 0.01
-        self.appearance_lr_max_steps = 30_000
+        self.appearance_lr_max_steps = 50_000
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # for anchor densification
+        # FiLM-MP change: replace the original continuous densification schedule
+        # with three phases:
+        # 0-5k: warm-up, 5k-15k: anchor growing, after 15k: refinement.
+        self.mp_growing = True
+        self.mp_warmup_until = 5_000
+        self.mp_growing_until = 15_000
+
+        # Original Scaffold-GS schedule, used only when running
+        # the FiLM baseline with --no-mp_growing.
         self.start_stat = 500
         self.update_from = 1500
-        self.update_interval = 100
         self.update_until = 15_000
 
+        # Shared densification settings.
+        self.update_interval = 100
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
-
-        # Adaptive-K Scaffold-GS
-        self.adaptive_k = False
-        self.adaptive_k_min = 6
-        self.adaptive_k_threshold = 0.0002
-        self.adaptive_k_boost = 2.0
-        self.adaptive_k_tau_min = 0.0001
-        self.adaptive_k_tau_max = 0.0006
-        self.adaptive_k_use_quantile = True
-        self.adaptive_k_quantile_min = 0.10
-        self.adaptive_k_quantile_max = 0.70
-        self.adaptive_k_score_topk = 1
-        self.adaptive_k_warmup = 12000
-        self.opacity_grad_lambda = 0.25
-        self.multiphase_gradient = True
-        self.multiphase_soft_lr_scale = 1.0
-        self.gradient_phase1_until = 7000
-        self.gradient_phase2_until = 12000
-
-        # Soft mask culling
-        self.soft_culling = False
-        self.soft_culling_k = 6
-        self.soft_culling_alpha = 0.25
 
         super().__init__(parser, "Optimization Parameters")
 
