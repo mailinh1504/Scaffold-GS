@@ -28,15 +28,13 @@ class ParamGroup:
             value = value if not fill_none else None
             if shorthand:
                 if t == bool:
-                    # FiLM-MP change: allow default-True flags to be disabled,
-                    # e.g. --no-mp_growing for the FiLM baseline.
+                    # BooleanOptionalAction supports both --flag and --no-flag.
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action=BooleanOptionalAction)
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    # FiLM-MP change: allow default-True flags to be disabled,
-                    # e.g. --no-mp_growing for the FiLM baseline.
+                    # BooleanOptionalAction supports both --flag and --no-flag.
                     group.add_argument("--" + key, default=value, action=BooleanOptionalAction)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
@@ -147,12 +145,17 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP change: replace the original continuous densification schedule
-        # with three phases:
-        # 0-5k: warm-up, 5k-15k: anchor growing, after 15k: refinement.
+        # FiLM-MP phase endpoints:
+        # coarse: position-gradient growing;
+        # fine: position candidates confirmed by opacity gradient;
+        # prune: no growing, only remove weak anchors;
+        # refine: fixed anchors, optimize existing parameters.
         self.mp_growing = True
-        self.mp_warmup_until = 5_000
-        self.mp_growing_until = 15_000
+        self.mp_coarse_until = 8_000
+        self.mp_fine_until = 20_000
+        self.mp_prune_until = 30_000
+        # Opacity confirmation threshold = mean(|dL/d alpha|) * ratio.
+        self.mp_opa_confirm_ratio = 1.0
 
         # Original Scaffold-GS schedule, used only when running
         # the FiLM baseline with --no-mp_growing.

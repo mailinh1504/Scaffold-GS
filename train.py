@@ -88,37 +88,49 @@ def saveRuntimeCode(dst: str) -> None:
     print("Backup Finished!")
 
 
-# FiLM-MP change: these helpers control when Scaffold-GS is allowed
-# to collect densification stats and grow new anchors.
+# FiLM-MP: small phase controller for anchor densification.
 def mp_enabled(opt):
     return getattr(opt, "mp_growing", False)
 
 
-def in_stats_window(iteration, opt):
-    if mp_enabled(opt):
-        # MP only collects grow statistics in the middle phase.
-        return opt.mp_warmup_until < iteration <= opt.mp_growing_until
-    return iteration < opt.update_until and iteration > opt.start_stat
+def phase_at(iteration, opt):
+    """Return the current densification phase."""
+    if not mp_enabled(opt):
+        return "base"
+    if iteration <= opt.mp_coarse_until:
+        return "coarse"
+    if iteration <= opt.mp_fine_until:
+        return "fine"
+    if iteration <= opt.mp_prune_until:
+        return "prune"
+    return "refine"
 
 
-def grow_now(iteration, opt):
+def stat_on(iteration, opt):
+    """Collect densification statistics only while grow/prune can use them."""
     if mp_enabled(opt):
-        # Grow after one full stat interval so warm-up gradients are not reused.
-        first_grow_iter = opt.mp_warmup_until + opt.update_interval
-        return (
-            first_grow_iter <= iteration <= opt.mp_growing_until
-            and iteration % opt.update_interval == 0
-        )
+        return opt.start_stat < iteration <= opt.mp_prune_until
+    return opt.start_stat < iteration < opt.update_until
+
+
+def grow_on(iteration, opt, phase):
+    """Run anchor growing on the configured update interval."""
     return (
-        iteration > opt.update_from
+        phase in {"base", "coarse", "fine"}
+        and iteration > opt.update_from
         and iteration % opt.update_interval == 0
     )
 
 
-def stats_expired(iteration, opt):
+def prune_on(iteration, opt, phase):
+    """Run pruning-only updates during the MP prune phase."""
+    return phase == "prune" and iteration % opt.update_interval == 0
+
+
+def free_now(iteration, opt):
+    """Free densification buffers once anchors become fixed."""
     if mp_enabled(opt):
-        # After the growing phase, training continues but anchors stay fixed.
-        return iteration > opt.mp_growing_until
+        return iteration > opt.mp_prune_until
     return iteration == opt.update_until
 
 
@@ -163,10 +175,11 @@ def training(
             )
         )
         logger.info(
-            "FiLM-MP growing schedule: warmup<= {} grow<= {} refinement> {}; metric=position_grad".format(
-                getattr(opt, "mp_warmup_until", opt.start_stat),
-                getattr(opt, "mp_growing_until", opt.update_until),
-                getattr(opt, "mp_growing_until", opt.update_until),
+            "FiLM-MP: coarse<= {} fine<= {} prune<= {} refine>; opacity_confirm_ratio={}".format(
+                getattr(opt, "mp_coarse_until", opt.update_until),
+                getattr(opt, "mp_fine_until", opt.update_until),
+                getattr(opt, "mp_prune_until", opt.update_until),
+                getattr(opt, "mp_opa_confirm_ratio", 1.0),
             )
         )
 
@@ -182,7 +195,7 @@ def training(
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     training_time_start = time.time()
-    stats_reset = not mp_enabled(opt)
+    last_phase = None
     stats_freed = False
     for iteration in range(first_iter, opt.iterations + 1):
         # network gui not available in scaffold-gs yet
@@ -222,14 +235,18 @@ def training(
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
-        # FiLM-MP change: discard warm-up stats before the growing phase starts.
-        if mp_enabled(opt) and not stats_reset and iteration > opt.mp_warmup_until:
-            gaussians.reset_densification_stats()
-            stats_reset = True
-            if logger is not None:
-                logger.info(
-                    "\n[ITER {}] Reset densification stats before FiLM-MP growing".format(iteration)
-                )
+        phase = phase_at(iteration, opt)
+        if mp_enabled(opt) and phase != last_phase:
+            if phase in {"fine", "prune"}:
+                gaussians.reset_densification_stats()
+                if logger is not None:
+                    logger.info(
+                        "\n[ITER {}] FiLM-MP enters {} phase; reset densification stats".format(
+                            iteration,
+                            phase,
+                        )
+                    )
+            last_phase = phase
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -244,9 +261,10 @@ def training(
             pipe.debug = True
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
-        stats_on = in_stats_window(iteration, opt)
-        # FiLM-MP change: retain 2D gradients only while densification is active.
-        retain_grad = stats_on
+        stats_on = stat_on(iteration, opt)
+        # FiLM-MP: coarse/base need 2D position gradients; fine also needs opacity gradients.
+        retain_grad = stats_on and phase in {"base", "coarse", "fine"}
+        retain_opacity_grad = stats_on and phase == "fine"
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -254,6 +272,7 @@ def training(
             background,
             visible_mask=voxel_visible_mask,
             retain_grad=retain_grad,
+            retain_opacity_grad=retain_opacity_grad,
         )
 
         (
@@ -322,30 +341,39 @@ def training(
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # FiLM-MP change: densification runs only inside the selected window.
+            # FiLM-MP: collect stats for grow/prune phases only.
             if stats_on:
-                # Accumulate Scaffold-GS densification statistics.
+                # Coarse/base use position gradients; fine also stores opacity gradients.
                 gaussians.training_statis(
                     viewspace_point_tensor,
                     opacity,
                     visibility_filter,
                     offset_selection_mask,
                     voxel_visible_mask,
+                    use_grad=retain_grad,
+                    use_opacity_grad=retain_opacity_grad,
                 )
 
-                # Grow anchors only at the scheduled update interval.
-                if grow_now(iteration, opt):
+                # Fine phase confirms position candidates with opacity gradients.
+                if grow_on(iteration, opt, phase):
                     gaussians.adjust_anchor(
                         check_interval=opt.update_interval,
                         success_threshold=opt.success_threshold,
                         grad_threshold=opt.densify_grad_threshold,
                         min_opacity=opt.min_opacity,
+                        grow_phase=phase,
+                        opacity_confirm_ratio=opt.mp_opa_confirm_ratio,
+                        allow_grow=True,
+                        allow_prune=True,
                     )
-            elif (
-                not stats_freed
-                and stats_expired(iteration, opt)
-            ):
-                # FiLM-MP change: free densification buffers during refinement.
+                elif prune_on(iteration, opt, phase):
+                    gaussians.prune_low_opacity(
+                        check_interval=opt.update_interval,
+                        success_threshold=opt.success_threshold,
+                        min_opacity=opt.min_opacity,
+                    )
+            elif not stats_freed and free_now(iteration, opt):
+                # FiLM-MP: refinement needs no densification buffers.
                 gaussians.release_densification_stats()
                 stats_freed = True
                 torch.cuda.empty_cache()
