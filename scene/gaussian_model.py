@@ -945,7 +945,10 @@ class GaussianModel:
 
             length_inc = self.get_anchor.shape[0]*self.n_offsets - init_length
             if length_inc == 0:
-                if level > 0:
+                # Scaffold-GS skips fine levels when no coarser anchor was added
+                # in the same call. In MP, coarse and fine are separate phases,
+                # so fine levels must still be allowed to grow.
+                if level > 0 and grow_phase == "base":
                     continue
             else:
                 candidate_mask = torch.cat([
@@ -986,9 +989,7 @@ class GaussianModel:
 
             # Fine phase: position proposes voxels, opacity gradient confirms them.
             if grow_phase == "fine":
-                if opacity_threshold is None or opacity_grads is None:
-                    remove_duplicates = torch.zeros_like(remove_duplicates)
-                else:
+                if opacity_threshold is not None and opacity_grads is not None:
                     opacity_values = opacity_grads
                     if candidate_mask.shape[0] > opacity_values.shape[0]:
                         padding = torch.zeros(

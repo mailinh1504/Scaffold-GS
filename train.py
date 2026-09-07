@@ -175,7 +175,7 @@ def training(
             )
         )
         logger.info(
-            "FiLM-MP: coarse<= {} fine<= {} prune<= {} refine>; opacity_confirm_ratio={}".format(
+            "FiLM-MP v2: coarse<= {} fine<= {} prune<= {} refine>; opacity_confirm_ratio={}".format(
                 getattr(opt, "mp_coarse_until", opt.update_until),
                 getattr(opt, "mp_fine_until", opt.update_until),
                 getattr(opt, "mp_prune_until", opt.update_until),
