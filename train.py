@@ -175,11 +175,13 @@ def training(
             )
         )
         logger.info(
-            "FiLM-MP v2: coarse<= {} fine<= {} prune<= {} refine>; opacity_confirm_ratio={}".format(
+            "FiLM-MP Light: coarse<= {} fine<= {} prune<= {} refine>; "
+            "opacity_confirm_ratio={} pos_rescue_ratio={}".format(
                 getattr(opt, "mp_coarse_until", opt.update_until),
                 getattr(opt, "mp_fine_until", opt.update_until),
                 getattr(opt, "mp_prune_until", opt.update_until),
                 getattr(opt, "mp_opa_confirm_ratio", 1.0),
+                getattr(opt, "mp_pos_rescue_ratio", 1.5),
             )
         )
 
@@ -363,6 +365,7 @@ def training(
                         min_opacity=opt.min_opacity,
                         grow_phase=phase,
                         opacity_confirm_ratio=opt.mp_opa_confirm_ratio,
+                        pos_rescue_ratio=getattr(opt, "mp_pos_rescue_ratio", 1.5),
                         allow_grow=True,
                         allow_prune=True,
                     )

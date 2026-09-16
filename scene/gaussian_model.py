@@ -851,10 +851,10 @@ class GaussianModel:
         position_grad = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.offset_gradient_accum[combined_mask] += position_grad
 
-        # FiLM-MP fine cue: g_opa = |dL / d alpha|.
-        # It is accumulated separately and used only as a confirmation signal.
+        # FiLM-MP fine cue: g_opa = ReLU(-dL / d alpha).
+        # Only positive values mean increasing opacity would reduce the loss.
         if use_opacity_grad and opacity.grad is not None:
-            opacity_grad_visible = opacity.grad.detach().abs().view(-1, 1)
+            opacity_grad_visible = torch.relu(-opacity.grad.detach()).view(-1, 1)
             opacity_grad = opacity_grad_visible[offset_selection_mask][update_filter]
             self.opacity_gradient_accum[combined_mask] += opacity_grad
             self.opacity_gradient_denom[combined_mask] += 1
@@ -918,37 +918,31 @@ class GaussianModel:
             offset_mask,
             grow_phase="base",
             opacity_grads=None,
-            opacity_confirm_ratio=1.0):
+            opacity_confirm_ratio=1.0,
+            pos_rescue_ratio=1.5):
         init_length = self.get_anchor.shape[0]*self.n_offsets
-        if grow_phase == "coarse":
-            levels = range(1)
-        elif grow_phase == "fine":
-            levels = range(1, self.update_depth)
-        else:
-            levels = range(self.update_depth)
+        levels = range(self.update_depth)
 
         opacity_threshold = None
         if grow_phase == "fine" and opacity_grads is not None:
             valid_opacity = opacity_grads[offset_mask]
             valid_opacity = valid_opacity[valid_opacity > 0]
             if valid_opacity.numel() > 0:
-                opacity_threshold = valid_opacity.mean().clamp_min(1e-12) * float(opacity_confirm_ratio)
+                opacity_threshold = valid_opacity.median().clamp_min(1e-12) * float(opacity_confirm_ratio)
 
         for level in levels:
             cur_threshold = threshold*((self.update_hierachy_factor//2)**level)
             candidate_mask = torch.logical_and(grads >= cur_threshold, offset_mask)
 
-            # Coarse/base keep Scaffold-GS sampling; fine is confirmed by opacity grad.
-            if grow_phase != "fine":
-                rand_mask = torch.rand_like(candidate_mask.float()) > (0.5**(level+1))
-                candidate_mask = torch.logical_and(candidate_mask, rand_mask)
+            # Keep Scaffold-GS random thinning in all phases.
+            rand_mask = torch.rand_like(candidate_mask.float()) > (0.5**(level+1))
+            candidate_mask = torch.logical_and(candidate_mask, rand_mask)
 
             length_inc = self.get_anchor.shape[0]*self.n_offsets - init_length
             if length_inc == 0:
-                # Scaffold-GS skips fine levels when no coarser anchor was added
-                # in the same call. In MP, coarse and fine are separate phases,
-                # so fine levels must still be allowed to grow.
-                if level > 0 and grow_phase == "base":
+                # Keep Scaffold-GS hierarchy: finer levels run only after a
+                # coarser anchor has been added in the same call.
+                if level > 0:
                     continue
             else:
                 candidate_mask = torch.cat([
@@ -991,6 +985,7 @@ class GaussianModel:
             if grow_phase == "fine":
                 if opacity_threshold is not None and opacity_grads is not None:
                     opacity_values = opacity_grads
+                    position_values = grads
                     if candidate_mask.shape[0] > opacity_values.shape[0]:
                         padding = torch.zeros(
                             candidate_mask.shape[0] - opacity_values.shape[0],
@@ -998,13 +993,31 @@ class GaussianModel:
                             device=opacity_values.device,
                         )
                         opacity_values = torch.cat([opacity_values, padding], dim=0)
+                    if candidate_mask.shape[0] > position_values.shape[0]:
+                        padding = torch.zeros(
+                            candidate_mask.shape[0] - position_values.shape[0],
+                            dtype=position_values.dtype,
+                            device=position_values.device,
+                        )
+                        position_values = torch.cat([position_values, padding], dim=0)
                     selected_opacity = opacity_values[candidate_mask].view(-1, 1)
+                    selected_position = position_values[candidate_mask].view(-1, 1)
                     voxel_opacity = scatter_max(
                         selected_opacity,
                         inverse_indices.unsqueeze(1).expand(-1, 1),
                         dim=0,
                     )[0].squeeze(1)
-                    remove_duplicates = torch.logical_and(remove_duplicates, voxel_opacity > opacity_threshold)
+                    voxel_position = scatter_max(
+                        selected_position,
+                        inverse_indices.unsqueeze(1).expand(-1, 1),
+                        dim=0,
+                    )[0].squeeze(1)
+                    opacity_confirmed = voxel_opacity > opacity_threshold
+                    position_rescued = voxel_position > cur_threshold * float(pos_rescue_ratio)
+                    remove_duplicates = torch.logical_and(
+                        remove_duplicates,
+                        torch.logical_or(opacity_confirmed, position_rescued),
+                    )
 
             candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
 
@@ -1132,6 +1145,7 @@ class GaussianModel:
             min_opacity=0.005,
             grow_phase="base",
             opacity_confirm_ratio=1.0,
+            pos_rescue_ratio=1.5,
             allow_grow=True,
             allow_prune=True):
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
@@ -1152,6 +1166,7 @@ class GaussianModel:
                 grow_phase=grow_phase,
                 opacity_grads=opa_grads,
                 opacity_confirm_ratio=opacity_confirm_ratio,
+                pos_rescue_ratio=pos_rescue_ratio,
             )
             self._reset_grow_stats(offset_mask)
 

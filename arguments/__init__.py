@@ -145,17 +145,19 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP v2 keeps the Scaffold-GS 15k densification budget by default.
-        # coarse: stable position-gradient growing.
-        # fine: position candidates confirmed by opacity-gradient saliency.
+        # FiLM-MP Light keeps Scaffold-GS growing as the main signal.
+        # coarse: position-gradient growing.
+        # fine: position growing with soft opacity-gradient confirmation.
         # prune: optional extra pruning if mp_prune_until > mp_fine_until.
         # refine: fixed anchors, optimize existing parameters.
         self.mp_growing = True
-        self.mp_coarse_until = 5_000
+        self.mp_coarse_until = 7_000
         self.mp_fine_until = 15_000
         self.mp_prune_until = 15_000
-        # Lower ratio makes opacity confirmation less conservative.
-        self.mp_opa_confirm_ratio = 0.5
+        # Fine phase keeps a candidate if opacity confirms it, or if
+        # position gradient is strong enough to rescue it.
+        self.mp_opa_confirm_ratio = 0.25
+        self.mp_pos_rescue_ratio = 1.5
 
         # Original Scaffold-GS schedule, used only when running
         # the FiLM baseline with --no-mp_growing.
