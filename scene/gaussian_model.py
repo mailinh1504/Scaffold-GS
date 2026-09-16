@@ -981,11 +981,28 @@ class GaussianModel:
 
             remove_duplicates = ~remove_duplicates
 
-            # Fine phase: position proposes voxels, opacity gradient confirms them.
+            # Fine phase: position proposes voxels, opacity confirms them.
+            # If opacity evidence is missing, only very strong position
+            # gradients can rescue a candidate. This keeps MP conservative.
             if grow_phase == "fine":
+                position_values = grads
+                if candidate_mask.shape[0] > position_values.shape[0]:
+                    padding = torch.zeros(
+                        candidate_mask.shape[0] - position_values.shape[0],
+                        dtype=position_values.dtype,
+                        device=position_values.device,
+                    )
+                    position_values = torch.cat([position_values, padding], dim=0)
+                selected_position = position_values[candidate_mask].view(-1, 1)
+                voxel_position = scatter_max(
+                    selected_position,
+                    inverse_indices.unsqueeze(1).expand(-1, 1),
+                    dim=0,
+                )[0].squeeze(1)
+                position_rescued = voxel_position > cur_threshold * float(pos_rescue_ratio)
+
                 if opacity_threshold is not None and opacity_grads is not None:
                     opacity_values = opacity_grads
-                    position_values = grads
                     if candidate_mask.shape[0] > opacity_values.shape[0]:
                         padding = torch.zeros(
                             candidate_mask.shape[0] - opacity_values.shape[0],
@@ -993,31 +1010,20 @@ class GaussianModel:
                             device=opacity_values.device,
                         )
                         opacity_values = torch.cat([opacity_values, padding], dim=0)
-                    if candidate_mask.shape[0] > position_values.shape[0]:
-                        padding = torch.zeros(
-                            candidate_mask.shape[0] - position_values.shape[0],
-                            dtype=position_values.dtype,
-                            device=position_values.device,
-                        )
-                        position_values = torch.cat([position_values, padding], dim=0)
                     selected_opacity = opacity_values[candidate_mask].view(-1, 1)
-                    selected_position = position_values[candidate_mask].view(-1, 1)
                     voxel_opacity = scatter_max(
                         selected_opacity,
                         inverse_indices.unsqueeze(1).expand(-1, 1),
                         dim=0,
                     )[0].squeeze(1)
-                    voxel_position = scatter_max(
-                        selected_position,
-                        inverse_indices.unsqueeze(1).expand(-1, 1),
-                        dim=0,
-                    )[0].squeeze(1)
                     opacity_confirmed = voxel_opacity > opacity_threshold
-                    position_rescued = voxel_position > cur_threshold * float(pos_rescue_ratio)
-                    remove_duplicates = torch.logical_and(
-                        remove_duplicates,
-                        torch.logical_or(opacity_confirmed, position_rescued),
-                    )
+                else:
+                    opacity_confirmed = torch.zeros_like(position_rescued)
+
+                remove_duplicates = torch.logical_and(
+                    remove_duplicates,
+                    torch.logical_or(opacity_confirmed, position_rescued),
+                )
 
             candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
 
