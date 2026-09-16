@@ -98,6 +98,20 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     training_time_start = time.time()
+    ak_stats_until = opt.adaptive_k_freeze + 1 if opt.adaptive_k else opt.update_until
+    stats_until = max(opt.update_until, ak_stats_until)
+    if logger is not None and opt.adaptive_k:
+        logger.info(
+            "FiLM-AK Light: full offsets < {}; update every {} iters until {}; k easy/hard = {}/{}; score=Top{}; Q={}".format(
+                opt.adaptive_k_warmup,
+                opt.adaptive_k_update_interval,
+                opt.adaptive_k_freeze,
+                opt.adaptive_k_easy,
+                opt.adaptive_k_hard,
+                opt.adaptive_k_score_topk,
+                opt.adaptive_k_quantile,
+            )
+        )
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -134,7 +148,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             pipe.debug = True
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
-        retain_grad = (iteration < opt.update_until and iteration >= 0)
+        retain_grad = (iteration < stats_until and iteration >= 0)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
@@ -166,15 +180,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
             
-            # densification
-            if iteration < opt.update_until and iteration > opt.start_stat:
-                # add statis
+            # Densification and FiLM-AK statistics share the same offset gradients.
+            if iteration < stats_until and iteration > opt.start_stat:
                 gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
-                
-                # densification
-                if iteration > opt.update_from and iteration % opt.update_interval == 0:
+
+                # FiLM-AK Light: update Top-K offset mask every 1000 iters
+                # from warmup to freeze, then keep the mask fixed.
+                if (
+                    opt.adaptive_k
+                    and opt.adaptive_k_warmup <= iteration <= opt.adaptive_k_freeze
+                    and (iteration - opt.adaptive_k_warmup) % opt.adaptive_k_update_interval == 0
+                ):
+                    gaussians.update_active_offsets()
+
+                if iteration < opt.update_until and iteration > opt.update_from and iteration % opt.update_interval == 0:
                     gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
-            elif iteration == opt.update_until:
+            elif iteration == stats_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
                 del gaussians.offset_denom

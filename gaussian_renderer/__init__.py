@@ -62,12 +62,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         neural_opacity = pc.get_opacity_mlp(feat, ob_view)
 
     if pc.adaptive_k_enabled:
-        active_offsets = pc.get_active_offsets(visible_mask).to(neural_opacity.device)
-        sorted_offsets = torch.argsort(neural_opacity.detach(), dim=1, descending=True)
-        offset_ranks = torch.empty_like(sorted_offsets)
-        rank_ids = torch.arange(pc.n_offsets, device=neural_opacity.device).view(1, -1)
-        offset_ranks.scatter_(1, sorted_offsets, rank_ids.expand_as(sorted_offsets))
-        adaptive_mask = offset_ranks < active_offsets
+        # FiLM-AK Light: use the gradient-selected Top-K offset mask.
+        adaptive_mask = pc.get_active_offset_mask(visible_mask).to(neural_opacity.device)
         neural_opacity = torch.where(
             adaptive_mask,
             neural_opacity,

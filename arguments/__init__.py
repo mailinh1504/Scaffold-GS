@@ -92,16 +92,16 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        self.iterations = 50_000
         self.position_lr_init = 0.0
         self.position_lr_final = 0.0
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
+        self.position_lr_max_steps = 50_000
 
         self.offset_lr_init = 0.01
         self.offset_lr_final = 0.0001
         self.offset_lr_delay_mult = 0.01
-        self.offset_lr_max_steps = 30_000
+        self.offset_lr_max_steps = 50_000
 
         self.feature_lr = 0.0075
         self.opacity_lr = 0.02
@@ -112,32 +112,32 @@ class OptimizationParams(ParamGroup):
         self.mlp_opacity_lr_init = 0.002
         self.mlp_opacity_lr_final = 0.00002
         self.mlp_opacity_lr_delay_mult = 0.01
-        self.mlp_opacity_lr_max_steps = 30_000
+        self.mlp_opacity_lr_max_steps = 50_000
 
         self.mlp_cov_lr_init = 0.004
         self.mlp_cov_lr_final = 0.004
         self.mlp_cov_lr_delay_mult = 0.01
-        self.mlp_cov_lr_max_steps = 30_000
+        self.mlp_cov_lr_max_steps = 50_000
 
         self.mlp_color_lr_init = 0.008
         self.mlp_color_lr_final = 0.00005
         self.mlp_color_lr_delay_mult = 0.01
-        self.mlp_color_lr_max_steps = 30_000
+        self.mlp_color_lr_max_steps = 50_000
 
         self.mlp_color_lr_init = 0.008
         self.mlp_color_lr_final = 0.00005
         self.mlp_color_lr_delay_mult = 0.01
-        self.mlp_color_lr_max_steps = 30_000
+        self.mlp_color_lr_max_steps = 50_000
 
         self.mlp_featurebank_lr_init = 0.01
         self.mlp_featurebank_lr_final = 0.00001
         self.mlp_featurebank_lr_delay_mult = 0.01
-        self.mlp_featurebank_lr_max_steps = 30_000
+        self.mlp_featurebank_lr_max_steps = 50_000
 
         self.appearance_lr_init = 0.05
         self.appearance_lr_final = 0.0005
         self.appearance_lr_delay_mult = 0.01
-        self.appearance_lr_max_steps = 30_000
+        self.appearance_lr_max_steps = 50_000
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
@@ -152,14 +152,16 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
-        # Adaptive-K Neural Gaussian
+        # FiLM-AK Light: delay pruning offsets, then keep Top-8 or Top-10
+        # offsets per anchor according to per-offset position gradients.
         self.adaptive_k = True
-        self.adaptive_k_min = 6
-        self.adaptive_k_warmup = 12000
-        self.adaptive_k_use_quantile = True
-        self.adaptive_k_quantile_min = 0.10
-        self.adaptive_k_quantile_max = 0.70
-        self.adaptive_k_score_topk = 1
+        self.adaptive_k_easy = 8
+        self.adaptive_k_hard = 10
+        self.adaptive_k_warmup = 10_000
+        self.adaptive_k_freeze = 40_000
+        self.adaptive_k_update_interval = 1_000
+        self.adaptive_k_quantile = 0.70
+        self.adaptive_k_score_topk = 3
 
         super().__init__(parser, "Optimization Parameters")
 
