@@ -88,49 +88,49 @@ def saveRuntimeCode(dst: str) -> None:
     print("Backup Finished!")
 
 
-# FiLM-MP: small phase controller for anchor densification.
+# FiLM-MP: small controller for grow -> score -> prune -> refine.
 def mp_enabled(opt):
     return getattr(opt, "mp_growing", False)
 
 
 def phase_at(iteration, opt):
-    """Return the current densification phase."""
+    """Return the current FiLM-MP phase."""
     if not mp_enabled(opt):
         return "base"
-    if iteration <= opt.mp_coarse_until:
-        return "coarse"
-    if iteration <= opt.mp_fine_until:
-        return "fine"
-    if iteration <= opt.mp_prune_until:
-        return "prune"
+    if iteration < opt.mp_score_from:
+        return "grow"
+    if iteration < opt.mp_prune_at:
+        return "score"
+    if iteration == opt.mp_prune_at:
+        return "compress"
     return "refine"
 
 
 def stat_on(iteration, opt):
-    """Collect densification statistics only while grow/prune can use them."""
+    """Collect stats while growing or scoring anchors."""
     if mp_enabled(opt):
-        return opt.start_stat < iteration <= opt.mp_prune_until
+        return opt.start_stat < iteration <= opt.mp_prune_at
     return opt.start_stat < iteration < opt.update_until
 
 
 def grow_on(iteration, opt, phase):
-    """Run anchor growing on the configured update interval."""
+    """Run the original Scaffold-GS anchor growing schedule."""
     return (
-        phase in {"base", "coarse", "fine"}
+        phase in {"base", "grow"}
         and iteration > opt.update_from
         and iteration % opt.update_interval == 0
     )
 
 
-def prune_on(iteration, opt, phase):
-    """Run pruning-only updates during the MP prune phase."""
-    return phase == "prune" and iteration % opt.update_interval == 0
+def compress_on(phase):
+    """Run one dual-gradient anchor pruning step."""
+    return phase == "compress"
 
 
 def free_now(iteration, opt):
     """Free densification buffers once anchors become fixed."""
     if mp_enabled(opt):
-        return iteration > opt.mp_prune_until
+        return iteration > opt.mp_prune_at
     return iteration == opt.update_until
 
 
@@ -175,13 +175,14 @@ def training(
             )
         )
         logger.info(
-            "FiLM-MP Light: coarse<= {} fine<= {} prune<= {} refine>; "
-            "opacity_confirm_ratio={} pos_rescue_ratio={}".format(
-                getattr(opt, "mp_coarse_until", opt.update_until),
-                getattr(opt, "mp_fine_until", opt.update_until),
-                getattr(opt, "mp_prune_until", opt.update_until),
-                getattr(opt, "mp_opa_confirm_ratio", 1.0),
-                getattr(opt, "mp_pos_rescue_ratio", 1.5),
+            "FiLM-MP: grow<{} score<{} compress@{} refine>; "
+            "score={}*pos + {}*opacity, prune_ratio={}".format(
+                getattr(opt, "mp_score_from", opt.update_until),
+                getattr(opt, "mp_prune_at", opt.update_until),
+                getattr(opt, "mp_prune_at", opt.update_until),
+                getattr(opt, "mp_pos_weight", 0.3),
+                getattr(opt, "mp_opa_weight", 0.7),
+                getattr(opt, "mp_anchor_prune_ratio", 0.03),
             )
         )
 
@@ -239,14 +240,11 @@ def training(
         gaussians.update_learning_rate(iteration)
         phase = phase_at(iteration, opt)
         if mp_enabled(opt) and phase != last_phase:
-            if phase in {"fine", "prune"}:
+            if phase == "score":
                 gaussians.reset_densification_stats()
                 if logger is not None:
                     logger.info(
-                        "\n[ITER {}] FiLM-MP enters {} phase; reset densification stats".format(
-                            iteration,
-                            phase,
-                        )
+                        "\n[ITER {}] FiLM-MP starts stable dual-gradient scoring".format(iteration)
                     )
             last_phase = phase
 
@@ -264,9 +262,9 @@ def training(
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
         stats_on = stat_on(iteration, opt)
-        # FiLM-MP: coarse/base need 2D position gradients; fine also needs opacity gradients.
-        retain_grad = stats_on and phase in {"base", "coarse", "fine"}
-        retain_opacity_grad = stats_on and phase == "fine"
+        # FiLM-MP: grow uses position stats; score/compress also stores opacity-removal stats.
+        retain_grad = stats_on and phase in {"base", "grow", "score", "compress"}
+        retain_opacity_grad = stats_on and phase in {"score", "compress"}
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -343,9 +341,8 @@ def training(
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # FiLM-MP: collect stats for grow/prune phases only.
+            # FiLM-MP: collect stats for grow/scoring phases only.
             if stats_on:
-                # Coarse/base use position gradients; fine also stores opacity gradients.
                 gaussians.training_statis(
                     viewspace_point_tensor,
                     opacity,
@@ -356,25 +353,33 @@ def training(
                     use_opacity_grad=retain_opacity_grad,
                 )
 
-                # Fine phase confirms position candidates with opacity gradients.
                 if grow_on(iteration, opt, phase):
                     gaussians.adjust_anchor(
                         check_interval=opt.update_interval,
                         success_threshold=opt.success_threshold,
                         grad_threshold=opt.densify_grad_threshold,
                         min_opacity=opt.min_opacity,
-                        grow_phase=phase,
-                        opacity_confirm_ratio=opt.mp_opa_confirm_ratio,
-                        pos_rescue_ratio=getattr(opt, "mp_pos_rescue_ratio", 1.5),
                         allow_grow=True,
                         allow_prune=True,
                     )
-                elif prune_on(iteration, opt, phase):
-                    gaussians.prune_low_opacity(
-                        check_interval=opt.update_interval,
-                        success_threshold=opt.success_threshold,
-                        min_opacity=opt.min_opacity,
+                elif mp_enabled(opt) and compress_on(phase):
+                    pruned = gaussians.prune_weak_anchors_by_score(
+                        prune_ratio=opt.mp_anchor_prune_ratio,
+                        pos_weight=opt.mp_pos_weight,
+                        opa_weight=opt.mp_opa_weight,
+                        topk=opt.mp_anchor_score_topk,
+                        min_observations=opt.mp_min_observations,
                     )
+                    if logger is not None:
+                        logger.info(
+                            "\n[ITER {}] FiLM-MP pruned {} weak anchors".format(
+                                iteration,
+                                pruned,
+                            )
+                        )
+                    gaussians.release_densification_stats()
+                    stats_freed = True
+                    torch.cuda.empty_cache()
             elif not stats_freed and free_now(iteration, opt):
                 # FiLM-MP: refinement needs no densification buffers.
                 gaussians.release_densification_stats()

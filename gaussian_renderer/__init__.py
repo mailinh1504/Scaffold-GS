@@ -68,7 +68,7 @@ def generate_neural_gaussians(
     else:
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
-    # FiLM-MP: keep Scaffold-GS offset selection; retain opacity grad only in fine phase.
+    # FiLM-MP: keep Scaffold-GS offset selection; retain opacity grad only for scoring.
     neural_opacity = neural_opacity.reshape([-1, 1])
     if is_training and retain_opacity_grad and neural_opacity.requires_grad:
         neural_opacity.retain_grad()

@@ -145,23 +145,19 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # Conservative FiLM-MP: keep Scaffold-GS as the main signal,
-        # but make fine-phase growing stricter to avoid over-growing.
-        # coarse: position-gradient growing.
-        # fine: opacity-confirmed growing, with only very strong position rescue.
-        # prune: optional extra pruning if mp_prune_until > mp_fine_until.
-        # refine: fixed anchors, optimize existing parameters.
+        # FiLM-MP: grow like FiLM/Scaffold-GS, then prune weak anchors
+        # once using stable position + opacity gradients.
         self.mp_growing = True
-        self.mp_coarse_until = 7_000
-        self.mp_fine_until = 15_000
-        self.mp_prune_until = 15_000
-        # Fine phase keeps candidates only when opacity confirms them,
-        # or when position gradient is much stronger than the grow threshold.
-        self.mp_opa_confirm_ratio = 0.75
-        self.mp_pos_rescue_ratio = 3.0
+        self.mp_score_from = 15_000
+        self.mp_prune_at = 30_000
+        self.mp_pos_weight = 0.3
+        self.mp_opa_weight = 0.7
+        self.mp_anchor_prune_ratio = 0.03
+        self.mp_anchor_score_topk = 3
+        self.mp_min_observations = 10
 
-        # Original Scaffold-GS schedule, used only when running
-        # the FiLM baseline with --no-mp_growing.
+        # Scaffold-GS densification schedule. FiLM-MP keeps this grow
+        # window unchanged before switching to stable gradient scoring.
         self.start_stat = 500
         self.update_from = 1500
         self.update_until = 15_000
@@ -170,7 +166,7 @@ class OptimizationParams(ParamGroup):
         self.update_interval = 100
         self.min_opacity = 0.005
         self.success_threshold = 0.8
-        self.densify_grad_threshold = 0.00025
+        self.densify_grad_threshold = 0.0002
 
         super().__init__(parser, "Optimization Parameters")
 
