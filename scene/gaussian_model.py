@@ -355,7 +355,7 @@ class GaussianModel:
         self._active_offsets = torch.empty(0)
         self._active_offset_mask = torch.empty(0)
         self.adaptive_k_enabled = False
-        self.adaptive_k_easy = min(8, self.n_offsets)
+        self.adaptive_k_easy = max(1, self.n_offsets - 1)
         self.adaptive_k_hard = self.n_offsets
         self.adaptive_k_quantile = 0.70
         self.adaptive_k_score_topk = min(3, self.n_offsets)
@@ -511,6 +511,20 @@ class GaussianModel:
             active_mask = active_mask[visible_mask]
         return active_mask.bool()
 
+    def get_dropped_offset_ids(self):
+        active_mask = self.get_active_offset_mask()
+        inactive_mask = ~active_mask
+        dropped_ids = torch.full(
+            (active_mask.shape[0], 1),
+            -1,
+            dtype=torch.long,
+            device=self.get_anchor.device,
+        )
+        has_dropped = inactive_mask.any(dim=1)
+        if has_dropped.any():
+            dropped_ids[has_dropped, 0] = inactive_mask.float().argmax(dim=1)[has_dropped]
+        return dropped_ids
+
     def set_full_active_offsets(self):
         anchor_count = self.get_anchor.shape[0]
         self._active_offsets = torch.full((anchor_count, 1), self.n_offsets, dtype=torch.long, device=self.get_anchor.device)
@@ -580,7 +594,8 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.adaptive_k_enabled = getattr(training_args, "adaptive_k", False)
-        self.adaptive_k_easy = max(1, min(getattr(training_args, "adaptive_k_easy", 8), self.n_offsets))
+        lite_easy = max(1, self.n_offsets - 1)
+        self.adaptive_k_easy = max(lite_easy, min(getattr(training_args, "adaptive_k_easy", lite_easy), self.n_offsets))
         self.adaptive_k_hard = max(self.adaptive_k_easy, min(getattr(training_args, "adaptive_k_hard", self.n_offsets), self.n_offsets))
         self.adaptive_k_quantile = min(max(getattr(training_args, "adaptive_k_quantile", 0.70), 0.0), 1.0)
         self.adaptive_k_score_topk = max(1, min(getattr(training_args, "adaptive_k_score_topk", 3), self.n_offsets))
@@ -709,9 +724,7 @@ class GaussianModel:
         for i in range(self._anchor_feat.shape[1]):
             l.append('f_anchor_feat_{}'.format(i))
         l.append('opacity')
-        l.append('active_offsets')
-        for i in range(self.n_offsets):
-            l.append('active_offset_{}'.format(i))
+        l.append('dropped_offset_id')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -726,15 +739,14 @@ class GaussianModel:
         anchor_feat = self._anchor_feat.detach().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
-        active_offsets = self.get_active_offsets().float().detach().cpu().numpy()
-        active_offset_mask = self.get_active_offset_mask().float().detach().cpu().numpy()
+        dropped_offset_ids = self.get_dropped_offset_ids().float().detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, active_offsets, active_offset_mask, scale, rotation), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, dropped_offset_ids, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -747,19 +759,27 @@ class GaussianModel:
                         np.asarray(plydata.elements[0]["z"])),  axis=1).astype(np.float32)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis].astype(np.float32)
         ply_property_names = [p.name for p in plydata.elements[0].properties]
-        if "active_offsets" in ply_property_names:
+        if "dropped_offset_id" in ply_property_names:
+            dropped_offset_ids = np.asarray(plydata.elements[0]["dropped_offset_id"])[..., np.newaxis].astype(np.int64)
+            active_offset_mask = np.ones((anchor.shape[0], self.n_offsets), dtype=np.bool_)
+            valid_drop = np.logical_and(dropped_offset_ids[:, 0] >= 0, dropped_offset_ids[:, 0] < self.n_offsets)
+            if valid_drop.any():
+                active_offset_mask[np.where(valid_drop)[0], dropped_offset_ids[valid_drop, 0]] = False
+                self.adaptive_k_enabled = True
+            active_offsets = active_offset_mask.sum(axis=1, keepdims=True).astype(np.int64)
+        elif "active_offsets" in ply_property_names:
             active_offsets = np.asarray(plydata.elements[0]["active_offsets"])[..., np.newaxis].astype(np.int64)
             self.adaptive_k_enabled = True
+            active_offset_mask_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("active_offset_")]
+            if len(active_offset_mask_names) == self.n_offsets:
+                active_offset_mask_names = sorted(active_offset_mask_names, key = lambda x: int(x.split('_')[-1]))
+                active_offset_mask = np.zeros((anchor.shape[0], self.n_offsets), dtype=np.bool_)
+                for idx, attr_name in enumerate(active_offset_mask_names):
+                    active_offset_mask[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32) > 0.5
+            else:
+                active_offset_mask = np.arange(self.n_offsets, dtype=np.int64)[None, :] < active_offsets
         else:
             active_offsets = np.full((anchor.shape[0], 1), self.n_offsets, dtype=np.int64)
-        active_offset_mask_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("active_offset_")]
-        if len(active_offset_mask_names) == self.n_offsets:
-            active_offset_mask_names = sorted(active_offset_mask_names, key = lambda x: int(x.split('_')[-1]))
-            active_offset_mask = np.zeros((anchor.shape[0], self.n_offsets), dtype=np.bool_)
-            for idx, attr_name in enumerate(active_offset_mask_names):
-                active_offset_mask[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32) > 0.5
-            self.adaptive_k_enabled = True
-        else:
             active_offset_mask = np.arange(self.n_offsets, dtype=np.int64)[None, :] < active_offsets
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]

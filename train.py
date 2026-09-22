@@ -98,14 +98,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     training_time_start = time.time()
-    ak_stats_until = opt.adaptive_k_freeze + 1 if opt.adaptive_k else opt.update_until
+    ak_stats_until = opt.adaptive_k_select_at + 1 if opt.adaptive_k else opt.update_until
     stats_until = max(opt.update_until, ak_stats_until)
     if logger is not None and opt.adaptive_k:
         logger.info(
-            "FiLM-AK Light: full offsets < {}; update every {} iters until {}; k easy/hard = {}/{}; score=Top{}; Q={}".format(
-                opt.adaptive_k_warmup,
-                opt.adaptive_k_update_interval,
-                opt.adaptive_k_freeze,
+            "FiLM-AK Lite: full offsets < {}; select once; k easy/hard = {}/{}; score=Top{}; Q={}".format(
+                opt.adaptive_k_select_at,
                 opt.adaptive_k_easy,
                 opt.adaptive_k_hard,
                 opt.adaptive_k_score_topk,
@@ -132,7 +130,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
-        gaussians.adaptive_k_enabled = opt.adaptive_k and iteration >= opt.adaptive_k_warmup
+        gaussians.adaptive_k_enabled = opt.adaptive_k and iteration >= opt.adaptive_k_select_at
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -184,14 +182,21 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration < stats_until and iteration > opt.start_stat:
                 gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
 
-                # FiLM-AK Light: update Top-K offset mask every 1000 iters
-                # from warmup to freeze, then keep the mask fixed.
-                if (
-                    opt.adaptive_k
-                    and opt.adaptive_k_warmup <= iteration <= opt.adaptive_k_freeze
-                    and (iteration - opt.adaptive_k_warmup) % opt.adaptive_k_update_interval == 0
-                ):
+                # FiLM-AK Lite: choose the Top-9/Top-10 offset mask once,
+                # after FiLM has nearly converged, then keep it fixed.
+                if opt.adaptive_k and iteration == opt.adaptive_k_select_at:
                     gaussians.update_active_offsets()
+                    if logger is not None:
+                        active_offsets = int(gaussians.get_active_offsets().sum().item())
+                        stored_offsets = gaussians.get_anchor.shape[0] * gaussians.n_offsets
+                        logger.info(
+                            "\n[ITER {}] FiLM-AK Lite selected offsets: active={} stored={} anchors={}".format(
+                                iteration,
+                                active_offsets,
+                                stored_offsets,
+                                gaussians.get_anchor.shape[0],
+                            )
+                        )
 
                 if iteration < opt.update_until and iteration > opt.update_from and iteration % opt.update_interval == 0:
                     gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)

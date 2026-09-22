@@ -152,14 +152,12 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
-        # FiLM-AK Light: delay pruning offsets, then keep Top-8 or Top-10
-        # offsets per anchor according to per-offset position gradients.
+        # FiLM-AK Lite: choose once late in training, then freeze.
+        # Easy anchors drop only their weakest offset; hard anchors keep all 10.
         self.adaptive_k = True
-        self.adaptive_k_easy = 8
+        self.adaptive_k_easy = 9
         self.adaptive_k_hard = 10
-        self.adaptive_k_warmup = 10_000
-        self.adaptive_k_freeze = 40_000
-        self.adaptive_k_update_interval = 1_000
+        self.adaptive_k_select_at = 35_000
         self.adaptive_k_quantile = 0.70
         self.adaptive_k_score_topk = 3
 
