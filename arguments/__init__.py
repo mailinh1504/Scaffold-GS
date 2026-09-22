@@ -145,19 +145,21 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP: grow like FiLM/Scaffold-GS, then prune weak anchors
-        # once using stable position + opacity gradients.
+        # FiLM-MP: stop growing early, then prune weak anchors twice
+        # using stable position + opacity gradients.
         self.mp_growing = True
-        self.mp_score_from = 15_000
-        self.mp_prune_at = 30_000
-        self.mp_pos_weight = 0.3
-        self.mp_opa_weight = 0.7
-        self.mp_anchor_prune_ratio = 0.03
+        self.mp_score_from = 12_000
+        self.mp_first_prune_at = 25_000
+        self.mp_second_prune_at = 35_000
+        self.mp_first_prune_ratio = 0.05
+        self.mp_second_prune_ratio = 0.03
+        self.mp_pos_weight = 0.2
+        self.mp_opa_weight = 0.8
         self.mp_anchor_score_topk = 3
         self.mp_min_observations = 10
 
-        # Scaffold-GS densification schedule. FiLM-MP keeps this grow
-        # window unchanged before switching to stable gradient scoring.
+        # Scaffold-GS densification schedule. FiLM-MP uses it only during
+        # the early grow phase; --no-mp_growing keeps the original window.
         self.start_stat = 500
         self.update_from = 1500
         self.update_until = 15_000
