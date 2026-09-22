@@ -68,11 +68,12 @@ def generate_neural_gaussians(
     else:
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
-    # FiLM-MP: keep Scaffold-GS offset selection; retain opacity grad only for scoring.
+    # FiLM-MP: late refinement can skip very weak active opacities.
     neural_opacity = neural_opacity.reshape([-1, 1])
     if is_training and retain_opacity_grad and neural_opacity.requires_grad:
         neural_opacity.retain_grad()
-    mask = (neural_opacity>0.0)
+    active_threshold = getattr(pc, "active_opacity_threshold", 0.0)
+    mask = neural_opacity > active_threshold
     mask = mask.view(-1)
 
     # select opacity

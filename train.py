@@ -138,6 +138,15 @@ def free_now(iteration, opt):
     return iteration == opt.update_until
 
 
+def active_opacity_threshold(iteration, opt):
+    """Use a small opacity activation threshold only in late MP refinement."""
+    if not mp_enabled(opt):
+        return 0.0
+    if iteration <= opt.mp_active_threshold_from:
+        return 0.0
+    return getattr(opt, "mp_active_opacity_threshold", 0.0)
+
+
 def training(
     dataset,
     opt,
@@ -180,14 +189,16 @@ def training(
         )
         logger.info(
             "FiLM-MP: grow<{} prune@{}+{} refine>; "
-            "score={}*pos + {}*opacity, prune_ratio={}+{}".format(
+            "score={}*pos + {}*opacity, prune_ratio={}+{}, active_tau={} after {}".format(
                 getattr(opt, "mp_score_from", opt.update_until),
                 getattr(opt, "mp_first_prune_at", opt.update_until),
                 getattr(opt, "mp_second_prune_at", opt.update_until),
                 getattr(opt, "mp_pos_weight", 0.3),
                 getattr(opt, "mp_opa_weight", 0.7),
-                getattr(opt, "mp_first_prune_ratio", 0.05),
-                getattr(opt, "mp_second_prune_ratio", 0.03),
+                getattr(opt, "mp_first_prune_ratio", 0.03),
+                getattr(opt, "mp_second_prune_ratio", 0.02),
+                getattr(opt, "mp_active_opacity_threshold", 0.0),
+                getattr(opt, "mp_active_threshold_from", opt.iterations),
             )
         )
 
@@ -244,6 +255,7 @@ def training(
 
         gaussians.update_learning_rate(iteration)
         phase = phase_at(iteration, opt)
+        gaussians.active_opacity_threshold = active_opacity_threshold(iteration, opt)
         if mp_enabled(opt) and phase != last_phase:
             if phase == "score1":
                 gaussians.reset_densification_stats()
@@ -467,7 +479,8 @@ def get_model_size_mb(model_path, iteration):
 
 
 def apply_render_options(gaussians, opt):
-    return
+    if opt is not None and mp_enabled(opt):
+        gaussians.active_opacity_threshold = getattr(opt, "mp_active_opacity_threshold", 0.0)
 
 
 def training_report(

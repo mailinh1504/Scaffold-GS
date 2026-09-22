@@ -360,6 +360,7 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.active_opacity_threshold = 0.0
         self.setup_functions()
 
         if self.use_feat_bank:
