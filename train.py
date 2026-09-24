@@ -139,12 +139,14 @@ def free_now(iteration, opt):
 
 
 def active_opacity_threshold(iteration, opt):
-    """Use a small opacity activation threshold only in late MP refinement."""
+    """Ramp a small opacity activation threshold during late MP refinement."""
     if not mp_enabled(opt):
         return 0.0
     if iteration <= opt.mp_active_threshold_from:
         return 0.0
-    return getattr(opt, "mp_active_opacity_threshold", 0.0)
+    ramp_steps = max(opt.iterations - opt.mp_active_threshold_from, 1)
+    ramp = min((iteration - opt.mp_active_threshold_from) / ramp_steps, 1.0)
+    return getattr(opt, "mp_active_opacity_threshold", 0.0) * ramp
 
 
 def training(
@@ -189,7 +191,7 @@ def training(
         )
         logger.info(
             "FiLM-MP: grow<{} prune@{}+{} refine>; "
-            "score={}*pos + {}*opacity, prune_ratio={}+{}, active_tau={} after {}".format(
+            "score={}*pos + {}*opacity, prune_ratio={}+{}, active_tau<= {} ramp_from {}".format(
                 getattr(opt, "mp_score_from", opt.update_until),
                 getattr(opt, "mp_first_prune_at", opt.update_until),
                 getattr(opt, "mp_second_prune_at", opt.update_until),

@@ -145,20 +145,20 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP: keep Scaffold-GS growing, prune weak anchors lightly,
-        # then ignore very weak active opacities during late refinement.
+        # FiLM-MP Balanced: prune weak anchors very lightly, then ramp a
+        # small active-opacity threshold late to reduce rendered Gaussians.
         self.mp_growing = True
         self.mp_score_from = 15_000
         self.mp_first_prune_at = 30_000
-        self.mp_second_prune_at = 40_000
-        self.mp_first_prune_ratio = 0.03
-        self.mp_second_prune_ratio = 0.02
-        self.mp_pos_weight = 0.3
-        self.mp_opa_weight = 0.7
-        self.mp_anchor_score_topk = 3
-        self.mp_min_observations = 10
-        self.mp_active_threshold_from = 40_000
-        self.mp_active_opacity_threshold = 0.01
+        self.mp_second_prune_at = 42_000
+        self.mp_first_prune_ratio = 0.02
+        self.mp_second_prune_ratio = 0.01
+        self.mp_pos_weight = 0.4
+        self.mp_opa_weight = 0.6
+        self.mp_anchor_score_topk = 5
+        self.mp_min_observations = 20
+        self.mp_active_threshold_from = 45_000
+        self.mp_active_opacity_threshold = 0.005
 
         # Scaffold-GS densification schedule. FiLM-MP uses it only during
         # the early grow phase; --no-mp_growing keeps the original window.
