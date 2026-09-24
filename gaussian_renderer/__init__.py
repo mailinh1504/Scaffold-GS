@@ -62,7 +62,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         neural_opacity = pc.get_opacity_mlp(feat, ob_view)
 
     if pc.adaptive_k_enabled:
-        # FiLM-AK Light: use the gradient-selected Top-K offset mask.
+        # FiLM-AK Safe-Lite: use the frozen Top-K offset mask selected late in training.
         adaptive_mask = pc.get_active_offset_mask(visible_mask).to(neural_opacity.device)
         neural_opacity = torch.where(
             adaptive_mask,

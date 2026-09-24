@@ -152,14 +152,17 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
-        # FiLM-AK Lite: choose once late in training, then freeze.
-        # Easy anchors drop only their weakest offset; hard anchors keep all 10.
+        # FiLM-AK Safe-Lite: choose once very late, then freeze.
+        # Drop one offset only when both gradient and opacity evidence are weak.
         self.adaptive_k = True
         self.adaptive_k_easy = 9
         self.adaptive_k_hard = 10
-        self.adaptive_k_select_at = 35_000
-        self.adaptive_k_quantile = 0.70
-        self.adaptive_k_score_topk = 3
+        self.adaptive_k_stat_from = 15_000
+        self.adaptive_k_select_at = 45_000
+        self.adaptive_k_quantile = 0.50
+        self.adaptive_k_score_topk = 5
+        self.adaptive_k_grad_weight = 0.5
+        self.adaptive_k_opacity_weight = 0.5
 
         super().__init__(parser, "Optimization Parameters")
 

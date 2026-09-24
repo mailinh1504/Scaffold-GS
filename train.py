@@ -102,12 +102,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     stats_until = max(opt.update_until, ak_stats_until)
     if logger is not None and opt.adaptive_k:
         logger.info(
-            "FiLM-AK Lite: full offsets < {}; select once; k easy/hard = {}/{}; score=Top{}; Q={}".format(
+            "FiLM-AK Safe-Lite: stats_from={}; select_at={}; k easy/hard={}/{}; score=Top{}; Q={}; weights pos/opa={}/{}".format(
+                opt.adaptive_k_stat_from,
                 opt.adaptive_k_select_at,
                 opt.adaptive_k_easy,
                 opt.adaptive_k_hard,
                 opt.adaptive_k_score_topk,
                 opt.adaptive_k_quantile,
+                opt.adaptive_k_grad_weight,
+                opt.adaptive_k_opacity_weight,
             )
         )
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -131,6 +134,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         gaussians.update_learning_rate(iteration)
         gaussians.adaptive_k_enabled = opt.adaptive_k and iteration >= opt.adaptive_k_select_at
+        if opt.adaptive_k and iteration == opt.adaptive_k_stat_from:
+            gaussians.reset_adaptive_k_stats()
+            if logger is not None:
+                logger.info("\n[ITER {}] FiLM-AK Safe-Lite resets stable offset statistics".format(iteration))
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -182,15 +189,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration < stats_until and iteration > opt.start_stat:
                 gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
 
-                # FiLM-AK Lite: choose the Top-9/Top-10 offset mask once,
-                # after FiLM has nearly converged, then keep it fixed.
+                # FiLM-AK Safe-Lite: score offsets by stable position + opacity
+                # evidence, choose the Top-9/Top-10 mask once, then freeze it.
                 if opt.adaptive_k and iteration == opt.adaptive_k_select_at:
                     gaussians.update_active_offsets()
                     if logger is not None:
                         active_offsets = int(gaussians.get_active_offsets().sum().item())
                         stored_offsets = gaussians.get_anchor.shape[0] * gaussians.n_offsets
                         logger.info(
-                            "\n[ITER {}] FiLM-AK Lite selected offsets: active={} stored={} anchors={}".format(
+                            "\n[ITER {}] FiLM-AK Safe-Lite selected offsets: active={} stored={} anchors={}".format(
                                 iteration,
                                 active_offsets,
                                 stored_offsets,
@@ -203,6 +210,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             elif iteration == stats_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
+                del gaussians.offset_opacity_accum
+                del gaussians.offset_opacity_denom
                 del gaussians.offset_denom
                 torch.cuda.empty_cache()
                     
