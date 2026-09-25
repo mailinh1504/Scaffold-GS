@@ -145,17 +145,15 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP Post: keep FiLM/Scaffold-GS training unchanged first,
-        # then use stable dual-gradient evidence for late compression.
+        # FiLM-MP Grow-Gated: use stable position + opacity gradients to
+        # decide which offsets may create new anchors. Rendering stays unchanged.
         self.mp_growing = True
-        self.mp_score_from = 35_000
-        self.mp_compress_at = 40_000
-        self.mp_offset_drop_quantile = 0.15
-        self.mp_anchor_prune_ratio = 0.005
-        self.mp_pos_weight = 0.5
-        self.mp_opa_weight = 0.5
-        self.mp_anchor_score_topk = 5
-        self.mp_min_observations = 30
+        self.mp_score_from = 10_000
+        self.mp_gate_at = 12_000
+        self.mp_gate_quantile = 0.20
+        self.mp_pos_weight = 0.7
+        self.mp_opa_weight = 0.3
+        self.mp_min_observations = 20
 
         # Original Scaffold-GS densification schedule.
         self.start_stat = 500

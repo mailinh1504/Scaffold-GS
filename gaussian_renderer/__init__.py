@@ -68,14 +68,8 @@ def generate_neural_gaussians(
     else:
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
-    active_offset_mask = pc.get_active_offset_mask(visible_mask).to(neural_opacity.device)
-    neural_opacity = torch.where(
-        active_offset_mask,
-        neural_opacity,
-        torch.full_like(neural_opacity, -1e6),
-    )
-
-    # FiLM-MP Post keeps the original Scaffold-GS activation rule.
+    # FiLM-MP Grow-Gated keeps rendering unchanged. The MP mask is used only
+    # inside anchor growing, not to suppress offsets during rendering.
     neural_opacity = neural_opacity.reshape([-1, 1])
     if is_training and retain_opacity_grad and neural_opacity.requires_grad:
         neural_opacity.retain_grad()
