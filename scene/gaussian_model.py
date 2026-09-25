@@ -349,8 +349,8 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
 
         self.offset_gradient_accum = torch.empty(0)
-        self.offset_opacity_accum = torch.empty(0)
-        self.offset_opacity_denom = torch.empty(0)
+        self.offset_opacity_grad_accum = torch.empty(0)
+        self.offset_opacity_grad_denom = torch.empty(0)
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
@@ -359,10 +359,12 @@ class GaussianModel:
         self.adaptive_k_enabled = False
         self.adaptive_k_easy = max(1, self.n_offsets - 1)
         self.adaptive_k_hard = self.n_offsets
-        self.adaptive_k_quantile = 0.50
+        self.adaptive_k_drop_quantile = 0.20
         self.adaptive_k_score_topk = min(5, self.n_offsets)
+        self.adaptive_k_min_observations = 30
         self.adaptive_k_grad_weight = 0.5
-        self.adaptive_k_opacity_weight = 0.5
+        self.adaptive_k_opacity_grad_weight = 0.5
+        self.adaptive_k_anchor_prune_ratio = 0.01
 
         self.optimizer = None
         self.percent_dense = 0
@@ -601,10 +603,12 @@ class GaussianModel:
         lite_easy = max(1, self.n_offsets - 1)
         self.adaptive_k_easy = max(lite_easy, min(getattr(training_args, "adaptive_k_easy", lite_easy), self.n_offsets))
         self.adaptive_k_hard = max(self.adaptive_k_easy, min(getattr(training_args, "adaptive_k_hard", self.n_offsets), self.n_offsets))
-        self.adaptive_k_quantile = min(max(getattr(training_args, "adaptive_k_quantile", 0.50), 0.0), 1.0)
+        self.adaptive_k_drop_quantile = min(max(getattr(training_args, "adaptive_k_drop_quantile", 0.20), 0.0), 1.0)
         self.adaptive_k_score_topk = max(1, min(getattr(training_args, "adaptive_k_score_topk", 5), self.n_offsets))
+        self.adaptive_k_min_observations = max(1, getattr(training_args, "adaptive_k_min_observations", 30))
         self.adaptive_k_grad_weight = max(0.0, getattr(training_args, "adaptive_k_grad_weight", 0.5))
-        self.adaptive_k_opacity_weight = max(0.0, getattr(training_args, "adaptive_k_opacity_weight", 0.5))
+        self.adaptive_k_opacity_grad_weight = max(0.0, getattr(training_args, "adaptive_k_opacity_grad_weight", 0.5))
+        self.adaptive_k_anchor_prune_ratio = max(0.0, getattr(training_args, "adaptive_k_anchor_prune_ratio", 0.01))
         if self._active_offsets.numel() == 0 or self._active_offsets.shape[0] != self.get_anchor.shape[0]:
             self.set_full_active_offsets()
         if self._active_offset_mask.numel() == 0 or self._active_offset_mask.shape[0] != self.get_anchor.shape[0]:
@@ -614,8 +618,8 @@ class GaussianModel:
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
-        self.offset_opacity_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
-        self.offset_opacity_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.offset_opacity_grad_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.offset_opacity_grad_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
@@ -726,11 +730,14 @@ class GaussianModel:
 
 
     def reset_adaptive_k_stats(self):
+        anchor_count = self.get_anchor.shape[0]
         offset_count = self.get_anchor.shape[0] * self.n_offsets
+        self.opacity_accum = torch.zeros((anchor_count, 1), device="cuda")
         self.offset_gradient_accum = torch.zeros((offset_count, 1), device="cuda")
-        self.offset_opacity_accum = torch.zeros((offset_count, 1), device="cuda")
-        self.offset_opacity_denom = torch.zeros((offset_count, 1), device="cuda")
+        self.offset_opacity_grad_accum = torch.zeros((offset_count, 1), device="cuda")
+        self.offset_opacity_grad_denom = torch.zeros((offset_count, 1), device="cuda")
         self.offset_denom = torch.zeros((offset_count, 1), device="cuda")
+        self.anchor_demon = torch.zeros((anchor_count, 1), device="cuda")
 
 
     def construct_list_of_attributes(self):
@@ -879,7 +886,14 @@ class GaussianModel:
 
 
     # statis grad information to guide liftting.
-    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
+    def training_statis(
+            self,
+            viewspace_point_tensor,
+            opacity,
+            update_filter,
+            offset_selection_mask,
+            anchor_visible_mask,
+            use_opacity_grad=False):
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
@@ -888,8 +902,6 @@ class GaussianModel:
         self.opacity_accum[anchor_visible_mask] += temp_opacity.sum(dim=1, keepdim=True)
 
         visible_offset_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)
-        self.offset_opacity_accum[visible_offset_mask] += temp_opacity.view(-1, 1)
-        self.offset_opacity_denom[visible_offset_mask] += 1
 
         # update anchor visiting statis
         self.anchor_demon[anchor_visible_mask] += 1
@@ -902,6 +914,16 @@ class GaussianModel:
 
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.offset_gradient_accum[combined_mask] += grad_norm
+
+        # FiLM-AK contribution cue: g_opa = ReLU(-alpha * dL / d alpha).
+        # It is positive only when increasing opacity would reduce the loss.
+        if use_opacity_grad and opacity.grad is not None:
+            alpha = opacity.detach().clamp_min(0.0)
+            opacity_grad_visible = torch.relu(-alpha * opacity.grad.detach()).view(-1, 1)
+            opacity_grad = opacity_grad_visible[offset_selection_mask][update_filter]
+            self.offset_opacity_grad_accum[combined_mask] += opacity_grad
+            self.offset_opacity_grad_denom[combined_mask] += 1
+
         self.offset_denom[combined_mask] += 1
 
 
@@ -1081,17 +1103,17 @@ class GaussianModel:
                                            device=self.offset_gradient_accum.device)
         self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
 
-        self.offset_opacity_accum[offset_mask] = 0
-        padding_offset_opacity_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_opacity_accum.shape[0], 1],
-                                           dtype=self.offset_opacity_accum.dtype,
-                                           device=self.offset_opacity_accum.device)
-        self.offset_opacity_accum = torch.cat([self.offset_opacity_accum, padding_offset_opacity_accum], dim=0)
+        self.offset_opacity_grad_accum[offset_mask] = 0
+        padding_offset_opacity_grad_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_opacity_grad_accum.shape[0], 1],
+                                           dtype=self.offset_opacity_grad_accum.dtype,
+                                           device=self.offset_opacity_grad_accum.device)
+        self.offset_opacity_grad_accum = torch.cat([self.offset_opacity_grad_accum, padding_offset_opacity_grad_accum], dim=0)
 
-        self.offset_opacity_denom[offset_mask] = 0
-        padding_offset_opacity_denom = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_opacity_denom.shape[0], 1],
-                                           dtype=self.offset_opacity_denom.dtype,
-                                           device=self.offset_opacity_denom.device)
-        self.offset_opacity_denom = torch.cat([self.offset_opacity_denom, padding_offset_opacity_denom], dim=0)
+        self.offset_opacity_grad_denom[offset_mask] = 0
+        padding_offset_opacity_grad_denom = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_opacity_grad_denom.shape[0], 1],
+                                           dtype=self.offset_opacity_grad_denom.dtype,
+                                           device=self.offset_opacity_grad_denom.device)
+        self.offset_opacity_grad_denom = torch.cat([self.offset_opacity_grad_denom, padding_offset_opacity_grad_denom], dim=0)
 
         # # prune anchors
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
@@ -1109,15 +1131,15 @@ class GaussianModel:
         del self.offset_gradient_accum
         self.offset_gradient_accum = offset_gradient_accum
 
-        offset_opacity_accum = self.offset_opacity_accum.view([-1, self.n_offsets])[~prune_mask]
-        offset_opacity_accum = offset_opacity_accum.view([-1, 1])
-        del self.offset_opacity_accum
-        self.offset_opacity_accum = offset_opacity_accum
+        offset_opacity_grad_accum = self.offset_opacity_grad_accum.view([-1, self.n_offsets])[~prune_mask]
+        offset_opacity_grad_accum = offset_opacity_grad_accum.view([-1, 1])
+        del self.offset_opacity_grad_accum
+        self.offset_opacity_grad_accum = offset_opacity_grad_accum
 
-        offset_opacity_denom = self.offset_opacity_denom.view([-1, self.n_offsets])[~prune_mask]
-        offset_opacity_denom = offset_opacity_denom.view([-1, 1])
-        del self.offset_opacity_denom
-        self.offset_opacity_denom = offset_opacity_denom
+        offset_opacity_grad_denom = self.offset_opacity_grad_denom.view([-1, self.n_offsets])[~prune_mask]
+        offset_opacity_grad_denom = offset_opacity_grad_denom.view([-1, 1])
+        del self.offset_opacity_grad_denom
+        self.offset_opacity_grad_denom = offset_opacity_grad_denom
 
         # update opacity accum
         if anchors_mask.sum()>0:
@@ -1140,59 +1162,151 @@ class GaussianModel:
 
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
+    def _safe_quantile(self, values, q, default=0.0, positive_only=False):
+        values = values[torch.isfinite(values)]
+        if positive_only:
+            values = values[values > 0]
+        if values.numel() == 0:
+            return torch.ones((), dtype=torch.float32, device=self.get_anchor.device) * default
+        q = min(max(float(q), 0.0), 1.0)
+        return torch.quantile(values.float(), q).clamp_min(1e-12 if positive_only else 0.0)
+
+    def _adaptive_k_scores(self):
+        anchor_count = self.get_anchor.shape[0]
+        if anchor_count == 0 or self.offset_denom.numel() == 0:
+            return None
+
+        pos_grads = self.offset_gradient_accum / self.offset_denom.clamp_min(1.0)
+        pos_grads[~torch.isfinite(pos_grads)] = 0.0
+        pos_grads = pos_grads.view(anchor_count, self.n_offsets)
+
+        opa_grads = self.offset_opacity_grad_accum / self.offset_opacity_grad_denom.clamp_min(1.0)
+        opa_grads[~torch.isfinite(opa_grads)] = 0.0
+        opa_grads = opa_grads.view(anchor_count, self.n_offsets)
+
+        offset_seen = self.offset_denom.view(anchor_count, self.n_offsets) >= self.adaptive_k_min_observations
+        offset_seen = torch.logical_and(offset_seen, self.offset_opacity_grad_denom.view(anchor_count, self.n_offsets) > 0)
+        anchor_seen = torch.logical_and(
+            self.anchor_demon.squeeze(dim=1) >= self.adaptive_k_min_observations,
+            offset_seen.any(dim=1),
+        )
+
+        pos_score = pos_grads / self._safe_quantile(pos_grads[offset_seen], 0.9, default=1.0, positive_only=True)
+        opa_score = opa_grads / self._safe_quantile(opa_grads[offset_seen], 0.9, default=1.0, positive_only=True)
+        weight_sum = max(self.adaptive_k_grad_weight + self.adaptive_k_opacity_grad_weight, 1e-12)
+        offset_score = (
+            self.adaptive_k_grad_weight * pos_score
+            + self.adaptive_k_opacity_grad_weight * opa_score
+        ) / weight_sum
+        offset_score = torch.where(offset_seen, offset_score, torch.zeros_like(offset_score))
+        pos_score = torch.where(offset_seen, pos_score, torch.zeros_like(pos_score))
+        opa_score = torch.where(offset_seen, opa_score, torch.zeros_like(opa_score))
+
+        return offset_score, pos_score, opa_score, offset_seen, anchor_seen
+
+    def _prune_adaptive_k_stats(self, prune_mask):
+        self.offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+        self.offset_gradient_accum = self.offset_gradient_accum.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+        self.offset_opacity_grad_accum = self.offset_opacity_grad_accum.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+        self.offset_opacity_grad_denom = self.offset_opacity_grad_denom.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+        self.opacity_accum = self.opacity_accum[~prune_mask]
+        self.anchor_demon = self.anchor_demon[~prune_mask]
+        self._active_offsets = self.get_active_offsets()[~prune_mask]
+        self._active_offset_mask = self.get_active_offset_mask()[~prune_mask]
+
+    def prune_weak_anchors_by_adaptive_k_score(self, prune_ratio=0.01):
+        scores = self._adaptive_k_scores()
+        if scores is None or prune_ratio <= 0:
+            return 0
+
+        offset_score, pos_score, opa_score, offset_seen, anchor_seen = scores
+        valid_anchor_scores = anchor_seen
+        if valid_anchor_scores.sum() == 0:
+            return 0
+
+        topk = min(self.adaptive_k_score_topk, self.n_offsets)
+        anchor_score = offset_score.topk(k=topk, dim=1).values.mean(dim=1)
+        anchor_pos_score = pos_score.topk(k=topk, dim=1).values.mean(dim=1)
+        anchor_opa_score = opa_score.topk(k=topk, dim=1).values.mean(dim=1)
+
+        anchor_opacity = (self.opacity_accum / self.anchor_demon.clamp_min(1.0)).squeeze(dim=1)
+        anchor_opacity_score = anchor_opacity / self._safe_quantile(
+            anchor_opacity[valid_anchor_scores],
+            0.9,
+            default=1.0,
+            positive_only=True,
+        )
+
+        q = self.adaptive_k_drop_quantile
+        weak_pos = anchor_pos_score <= self._safe_quantile(anchor_pos_score[valid_anchor_scores], q)
+        weak_opa = anchor_opa_score <= self._safe_quantile(anchor_opa_score[valid_anchor_scores], q)
+        weak_alpha = anchor_opacity_score <= self._safe_quantile(anchor_opacity_score[valid_anchor_scores], q)
+        safe_candidates = torch.logical_and(
+            valid_anchor_scores,
+            torch.logical_and(torch.logical_and(weak_pos, weak_opa), weak_alpha),
+        )
+
+        prune_count = min(int(self.get_anchor.shape[0] * prune_ratio), int(safe_candidates.sum().item()))
+        if prune_count <= 0:
+            return 0
+
+        candidate_ids = torch.nonzero(safe_candidates, as_tuple=False).squeeze(dim=1)
+        candidate_scores = anchor_score[candidate_ids] + anchor_opacity_score[candidate_ids]
+        prune_ids = candidate_ids[torch.topk(candidate_scores, k=prune_count, largest=False).indices]
+
+        prune_mask = torch.zeros(self.get_anchor.shape[0], dtype=torch.bool, device=self.get_anchor.device)
+        prune_mask[prune_ids] = True
+        self._prune_adaptive_k_stats(prune_mask)
+        self.prune_anchor(prune_mask)
+        self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        return int(prune_mask.sum().item())
+
     def update_active_offsets(self):
-        if not self.adaptive_k_enabled or self.offset_denom.numel() == 0:
+        if not self.adaptive_k_enabled:
             self.set_full_active_offsets()
             return
 
-        grads = self.offset_gradient_accum / self.offset_denom.clamp_min(1.0)
-        grads[~torch.isfinite(grads)] = 0.0
-        anchor_grads = grads.view([-1, self.n_offsets])
+        scores = self._adaptive_k_scores()
+        if scores is None:
+            self.set_full_active_offsets()
+            return
 
-        opacity = self.offset_opacity_accum / self.offset_opacity_denom.clamp_min(1.0)
-        opacity[~torch.isfinite(opacity)] = 0.0
-        anchor_opacity = opacity.view([-1, self.n_offsets])
+        offset_score, pos_score, opa_score, offset_seen, anchor_seen = scores
+        valid_scores = offset_score[offset_seen]
+        if valid_scores.numel() == 0:
+            self.set_full_active_offsets()
+            return
 
-        def stable_q90(values):
-            valid_values = values[torch.logical_and(torch.isfinite(values), values > 0)]
-            if valid_values.numel() == 0:
-                return values.new_tensor(1.0)
-            return torch.quantile(valid_values.float(), 0.9).clamp_min(1e-12)
+        q = self.adaptive_k_drop_quantile
+        score_threshold = self._safe_quantile(valid_scores, q)
+        pos_threshold = self._safe_quantile(pos_score[offset_seen], q)
+        opa_threshold = self._safe_quantile(opa_score[offset_seen], q)
 
-        grad_score = anchor_grads / stable_q90(anchor_grads)
-        opacity_score = anchor_opacity / stable_q90(anchor_opacity)
-        weight_sum = max(self.adaptive_k_grad_weight + self.adaptive_k_opacity_weight, 1e-12)
-        offset_scores = (
-            self.adaptive_k_grad_weight * grad_score
-            + self.adaptive_k_opacity_weight * opacity_score
-        ) / weight_sum
+        inf_scores = torch.full_like(offset_score, float("inf"))
+        masked_scores = torch.where(offset_seen, offset_score, inf_scores)
+        weakest_score, weakest_ids = masked_scores.min(dim=1)
+        row_ids = torch.arange(self.get_anchor.shape[0], device=self.get_anchor.device)
+        weakest_pos = pos_score[row_ids, weakest_ids]
+        weakest_opa = opa_score[row_ids, weakest_ids]
 
-        topk = min(self.adaptive_k_score_topk, self.n_offsets)
-        anchor_scores = offset_scores.topk(k=topk, dim=1).values.mean(dim=1, keepdim=True)
-
-        anchor_seen = self.offset_denom.view([-1, self.n_offsets]).sum(dim=1, keepdim=True) > 0
-        valid_scores = anchor_scores.detach().view(-1)[anchor_seen.view(-1)]
-        if valid_scores.numel() > 1:
-            score_threshold = torch.quantile(valid_scores, self.adaptive_k_quantile)
-        else:
-            score_threshold = anchor_scores.new_tensor(float("inf"))
-
-        easy_k = torch.full_like(anchor_scores, self.adaptive_k_easy, dtype=torch.long)
-        hard_k = torch.full_like(anchor_scores, self.adaptive_k_hard, dtype=torch.long)
-        active_offsets = torch.where(anchor_scores >= score_threshold, hard_k, easy_k)
-        active_offsets = torch.where(anchor_seen, active_offsets, torch.full_like(active_offsets, self.n_offsets))
-        self._active_offsets = active_offsets
-
-        sorted_offsets = torch.argsort(offset_scores.detach(), dim=1, descending=True)
-        offset_ranks = torch.empty_like(sorted_offsets)
-        rank_ids = torch.arange(self.n_offsets, device=anchor_grads.device).view(1, -1)
-        offset_ranks.scatter_(1, sorted_offsets, rank_ids.expand_as(sorted_offsets))
-        active_mask = offset_ranks < active_offsets
-        self._active_offset_mask = torch.where(
-            anchor_seen.expand_as(active_mask),
-            active_mask,
-            torch.ones_like(active_mask, dtype=torch.bool),
+        drop_anchor = torch.logical_and(
+            anchor_seen,
+            torch.logical_and(
+                torch.isfinite(weakest_score),
+                torch.logical_and(
+                    weakest_score <= score_threshold,
+                    torch.logical_and(weakest_pos <= pos_threshold, weakest_opa <= opa_threshold),
+                ),
+            ),
         )
+
+        active_mask = torch.ones((self.get_anchor.shape[0], self.n_offsets), dtype=torch.bool, device=self.get_anchor.device)
+        drop_rows = torch.nonzero(drop_anchor, as_tuple=False).squeeze(dim=1)
+        if drop_rows.numel() > 0:
+            active_mask[drop_rows, weakest_ids[drop_rows]] = False
+
+        self._active_offset_mask = active_mask
+        self._active_offsets = active_mask.sum(dim=1, keepdim=True).long()
 
     def save_mlp_checkpoints(self, path, mode = 'unite'):#split or unite
         mkdir_p(os.path.dirname(path))

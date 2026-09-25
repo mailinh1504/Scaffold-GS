@@ -15,7 +15,12 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 
-def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False):
+def generate_neural_gaussians(
+        viewpoint_camera,
+        pc : GaussianModel,
+        visible_mask=None,
+        is_training=False,
+        retain_opacity_grad=False):
     ## view frustum filtering for acceleration
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
@@ -62,7 +67,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         neural_opacity = pc.get_opacity_mlp(feat, ob_view)
 
     if pc.adaptive_k_enabled:
-        # FiLM-AK Safe-Lite: use the frozen Top-K offset mask selected late in training.
+        # FiLM-AK Safe-Contribution: use the frozen weak-offset suppression mask.
         adaptive_mask = pc.get_active_offset_mask(visible_mask).to(neural_opacity.device)
         neural_opacity = torch.where(
             adaptive_mask,
@@ -72,6 +77,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
+    if is_training and retain_opacity_grad and neural_opacity.requires_grad:
+        neural_opacity.retain_grad()
     mask = (neural_opacity>0.0)
     mask = mask.view(-1)
 
@@ -128,7 +135,15 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         return xyz, color, opacity, scaling, rot, neural_gaussian_count
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
+def render(
+        viewpoint_camera,
+        pc : GaussianModel,
+        pipe,
+        bg_color : torch.Tensor,
+        scaling_modifier = 1.0,
+        visible_mask=None,
+        retain_grad=False,
+        retain_opacity_grad=False):
     """
     Render the scene.
 
@@ -137,7 +152,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_training = pc.get_color_mlp.training
 
     if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_gaussian_count = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_gaussian_count = generate_neural_gaussians(
+            viewpoint_camera,
+            pc,
+            visible_mask,
+            is_training=is_training,
+            retain_opacity_grad=retain_opacity_grad,
+        )
     else:
         xyz, color, opacity, scaling, rot, neural_gaussian_count = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
 
