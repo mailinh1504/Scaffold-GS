@@ -152,19 +152,20 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
-        # FiLM-AK Safe-Contribution: keep all offsets first, then suppress
-        # only offsets with weak position and opacity-gradient contribution.
+        # FiLM-AK Early-Safe: keep all offsets during warm-up, then select a
+        # light offset mask before densification ends so weak offsets create
+        # fewer new anchors while quality still has time to recover.
         self.adaptive_k = True
         self.adaptive_k_easy = 9
         self.adaptive_k_hard = 10
-        self.adaptive_k_stat_from = 35_000
-        self.adaptive_k_select_at = 40_000
-        self.adaptive_k_drop_quantile = 0.20
-        self.adaptive_k_score_topk = 5
+        self.adaptive_k_stat_from = 10_000
+        self.adaptive_k_select_at = 12_000
+        self.adaptive_k_drop_quantile = 0.10
+        self.adaptive_k_score_topk = 3
         self.adaptive_k_min_observations = 30
-        self.adaptive_k_grad_weight = 0.5
-        self.adaptive_k_opacity_grad_weight = 0.5
-        self.adaptive_k_anchor_prune_ratio = 0.01
+        self.adaptive_k_grad_weight = 0.6
+        self.adaptive_k_opacity_grad_weight = 0.4
+        self.adaptive_k_anchor_prune_ratio = 0.0
 
         super().__init__(parser, "Optimization Parameters")
 

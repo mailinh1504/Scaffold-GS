@@ -67,7 +67,7 @@ def generate_neural_gaussians(
         neural_opacity = pc.get_opacity_mlp(feat, ob_view)
 
     if pc.adaptive_k_enabled:
-        # FiLM-AK Safe-Contribution: use the frozen weak-offset suppression mask.
+        # FiLM-AK Early-Safe: use the selected weak-offset suppression mask.
         adaptive_mask = pc.get_active_offset_mask(visible_mask).to(neural_opacity.device)
         neural_opacity = torch.where(
             adaptive_mask,

@@ -102,7 +102,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     stats_until = max(opt.update_until, ak_stats_until)
     if logger is not None and opt.adaptive_k:
         logger.info(
-            "FiLM-AK Safe-Contribution: stats_from={}; select_at={}; drop_q={}; score=Top{}; min_obs={}; weights pos/opa_grad={}/{}; anchor_prune={}".format(
+            "FiLM-AK Early-Safe: warm-up full offsets; collect dual-gradient stats from {} to {}; drop_q={}; score=Top{}; min_obs={}; weights pos/opa_grad={}/{}; anchor_prune={}".format(
                 opt.adaptive_k_stat_from,
                 opt.adaptive_k_select_at,
                 opt.adaptive_k_drop_quantile,
@@ -133,11 +133,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        # FiLM-AK Early-Safe: use the selected offset mask from select_at
+        # onward, including the last densification iterations before 15k.
         gaussians.adaptive_k_enabled = opt.adaptive_k and iteration >= opt.adaptive_k_select_at
         if opt.adaptive_k and iteration == opt.adaptive_k_stat_from:
             gaussians.reset_adaptive_k_stats()
             if logger is not None:
-                logger.info("\n[ITER {}] FiLM-AK Safe-Contribution resets stable offset statistics".format(iteration))
+                logger.info("\n[ITER {}] FiLM-AK Early-Safe resets stable offset statistics".format(iteration))
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -206,8 +208,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     use_opacity_grad=retain_opacity_grad,
                 )
 
-                # FiLM-AK Safe-Contribution: prune only anchors weak in all cues,
-                # then drop at most one clearly weak offset per remaining anchor.
+                # FiLM-AK Early-Safe: select weak offsets before densification
+                # ends; anchor pruning is disabled by default to protect quality.
                 if opt.adaptive_k and iteration == opt.adaptive_k_select_at:
                     pruned = gaussians.prune_weak_anchors_by_adaptive_k_score(
                         prune_ratio=opt.adaptive_k_anchor_prune_ratio,
@@ -217,7 +219,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         active_offsets = int(gaussians.get_active_offsets().sum().item())
                         stored_offsets = gaussians.get_anchor.shape[0] * gaussians.n_offsets
                         logger.info(
-                            "\n[ITER {}] FiLM-AK Safe-Contribution selected offsets: active={} stored={} anchors={} pruned={}".format(
+                            "\n[ITER {}] FiLM-AK Early-Safe selected offsets: active={} stored={} anchors={} pruned={}".format(
                                 iteration,
                                 active_offsets,
                                 stored_offsets,

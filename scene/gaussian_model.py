@@ -359,12 +359,12 @@ class GaussianModel:
         self.adaptive_k_enabled = False
         self.adaptive_k_easy = max(1, self.n_offsets - 1)
         self.adaptive_k_hard = self.n_offsets
-        self.adaptive_k_drop_quantile = 0.20
-        self.adaptive_k_score_topk = min(5, self.n_offsets)
+        self.adaptive_k_drop_quantile = 0.10
+        self.adaptive_k_score_topk = min(3, self.n_offsets)
         self.adaptive_k_min_observations = 30
-        self.adaptive_k_grad_weight = 0.5
-        self.adaptive_k_opacity_grad_weight = 0.5
-        self.adaptive_k_anchor_prune_ratio = 0.01
+        self.adaptive_k_grad_weight = 0.6
+        self.adaptive_k_opacity_grad_weight = 0.4
+        self.adaptive_k_anchor_prune_ratio = 0.0
 
         self.optimizer = None
         self.percent_dense = 0
@@ -603,12 +603,12 @@ class GaussianModel:
         lite_easy = max(1, self.n_offsets - 1)
         self.adaptive_k_easy = max(lite_easy, min(getattr(training_args, "adaptive_k_easy", lite_easy), self.n_offsets))
         self.adaptive_k_hard = max(self.adaptive_k_easy, min(getattr(training_args, "adaptive_k_hard", self.n_offsets), self.n_offsets))
-        self.adaptive_k_drop_quantile = min(max(getattr(training_args, "adaptive_k_drop_quantile", 0.20), 0.0), 1.0)
-        self.adaptive_k_score_topk = max(1, min(getattr(training_args, "adaptive_k_score_topk", 5), self.n_offsets))
+        self.adaptive_k_drop_quantile = min(max(getattr(training_args, "adaptive_k_drop_quantile", 0.10), 0.0), 1.0)
+        self.adaptive_k_score_topk = max(1, min(getattr(training_args, "adaptive_k_score_topk", 3), self.n_offsets))
         self.adaptive_k_min_observations = max(1, getattr(training_args, "adaptive_k_min_observations", 30))
-        self.adaptive_k_grad_weight = max(0.0, getattr(training_args, "adaptive_k_grad_weight", 0.5))
-        self.adaptive_k_opacity_grad_weight = max(0.0, getattr(training_args, "adaptive_k_opacity_grad_weight", 0.5))
-        self.adaptive_k_anchor_prune_ratio = max(0.0, getattr(training_args, "adaptive_k_anchor_prune_ratio", 0.01))
+        self.adaptive_k_grad_weight = max(0.0, getattr(training_args, "adaptive_k_grad_weight", 0.6))
+        self.adaptive_k_opacity_grad_weight = max(0.0, getattr(training_args, "adaptive_k_opacity_grad_weight", 0.4))
+        self.adaptive_k_anchor_prune_ratio = max(0.0, getattr(training_args, "adaptive_k_anchor_prune_ratio", 0.0))
         if self._active_offsets.numel() == 0 or self._active_offsets.shape[0] != self.get_anchor.shape[0]:
             self.set_full_active_offsets()
         if self._active_offset_mask.numel() == 0 or self._active_offset_mask.shape[0] != self.get_anchor.shape[0]:
@@ -1087,6 +1087,11 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
+        if self.adaptive_k_enabled:
+            # FiLM-AK Early-Safe: inactive offsets may still contain warm-up
+            # gradients, but they must not create new anchors after selection.
+            active_offset_mask = self.get_active_offset_mask().view(-1)
+            offset_mask = torch.logical_and(offset_mask, active_offset_mask)
 
         self.anchor_growing(grads_norm, grad_threshold, offset_mask)
 
