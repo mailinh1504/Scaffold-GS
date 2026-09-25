@@ -356,6 +356,7 @@ class GaussianModel:
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+        self._active_offset_mask = torch.empty(0)
 
         self.optimizer = None
         self.percent_dense = 0
@@ -487,6 +488,37 @@ class GaussianModel:
     def get_anchor(self):
         return self._anchor
 
+    def get_active_offset_mask(self, visible_mask=None):
+        if self._active_offset_mask.numel() == 0 or self._active_offset_mask.shape[0] != self.get_anchor.shape[0]:
+            count = self.get_anchor.shape[0] if visible_mask is None else int(visible_mask.sum().item())
+            return torch.ones((count, self.n_offsets), dtype=torch.bool, device=self.get_anchor.device)
+        active_mask = self._active_offset_mask
+        if visible_mask is not None:
+            active_mask = active_mask[visible_mask]
+        return active_mask.bool()
+
+    def get_dropped_offset_ids(self):
+        active_mask = self.get_active_offset_mask()
+        inactive_mask = ~active_mask
+        dropped_ids = torch.full(
+            (active_mask.shape[0], 1),
+            -1,
+            dtype=torch.long,
+            device=active_mask.device,
+        )
+        has_drop = inactive_mask.any(dim=1)
+        if has_drop.any():
+            dropped_ids[has_drop, 0] = inactive_mask[has_drop].float().argmax(dim=1).long()
+        return dropped_ids
+
+    def set_full_active_offsets(self):
+        anchor_count = self.get_anchor.shape[0]
+        self._active_offset_mask = torch.ones(
+            (anchor_count, self.n_offsets),
+            dtype=torch.bool,
+            device=self.get_anchor.device,
+        )
+
     @property
     def set_anchor(self, new_anchor):
         assert self._anchor.shape == new_anchor.shape
@@ -564,12 +596,15 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self.set_full_active_offsets()
 
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
 
         self.reset_densification_stats()
+        if self._active_offset_mask.numel() == 0 or self._active_offset_mask.shape[0] != self.get_anchor.shape[0]:
+            self.set_full_active_offsets()
 
 
 
@@ -722,6 +757,7 @@ class GaussianModel:
         for i in range(self._anchor_feat.shape[1]):
             l.append('f_anchor_feat_{}'.format(i))
         l.append('opacity')
+        l.append('dropped_offset_id')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -736,19 +772,21 @@ class GaussianModel:
         anchor_feat = self._anchor_feat.detach().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
+        dropped_offset_ids = self.get_dropped_offset_ids().float().detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, dropped_offset_ids, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
     def load_ply_sparse_gaussian(self, path):
         plydata = PlyData.read(path)
+        ply_property_names = [p.name for p in plydata.elements[0].properties]
 
         anchor = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
@@ -781,6 +819,15 @@ class GaussianModel:
             offsets[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         offsets = offsets.reshape((offsets.shape[0], 3, -1))
 
+        if "dropped_offset_id" in ply_property_names:
+            dropped_offset_ids = np.asarray(plydata.elements[0]["dropped_offset_id"])[..., np.newaxis].astype(np.int64)
+            active_offset_mask = np.ones((anchor.shape[0], self.n_offsets), dtype=np.bool_)
+            valid_drop = np.logical_and(dropped_offset_ids[:, 0] >= 0, dropped_offset_ids[:, 0] < self.n_offsets)
+            if valid_drop.any():
+                active_offset_mask[np.where(valid_drop)[0], dropped_offset_ids[valid_drop, 0]] = False
+        else:
+            active_offset_mask = np.ones((anchor.shape[0], self.n_offsets), dtype=np.bool_)
+
         self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
@@ -788,6 +835,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._active_offset_mask = torch.tensor(active_offset_mask, dtype=torch.bool, device="cuda")
 
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -916,6 +964,8 @@ class GaussianModel:
 
     def prune_anchor(self,mask):
         valid_points_mask = ~mask
+        if self._active_offset_mask.numel() != 0 and self._active_offset_mask.shape[0] == valid_points_mask.shape[0]:
+            self._active_offset_mask = self._active_offset_mask[valid_points_mask]
 
         optimizable_tensors = self._prune_anchor_optimizer(valid_points_mask)
 
@@ -1020,6 +1070,9 @@ class GaussianModel:
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
 
+                new_active_offset_mask = torch.ones((new_opacities.shape[0], self.n_offsets), dtype=torch.bool, device='cuda')
+                self._active_offset_mask = torch.cat([self.get_active_offset_mask(), new_active_offset_mask], dim=0)
+
                 torch.cuda.empty_cache()
 
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -1106,11 +1159,12 @@ class GaussianModel:
 
     def prune_weak_anchors_by_score(
             self,
-            prune_ratio=0.01,
+            prune_ratio=0.005,
             pos_weight=0.5,
             opa_weight=0.5,
             topk=5,
-            min_observations=30):
+            min_observations=30,
+            weak_quantile=0.15):
         """Safely prune anchors weak in position, opacity-gradient, and opacity."""
         anchor_count = self.get_anchor.shape[0]
         if anchor_count == 0 or prune_ratio <= 0:
@@ -1125,11 +1179,16 @@ class GaussianModel:
         opa_grads = opa_grads.squeeze(dim=-1).view(anchor_count, self.n_offsets)
 
         offset_seen = self.offset_denom.view(anchor_count, self.n_offsets) >= min_observations
-        anchor_seen = self.anchor_demon.squeeze(dim=1) >= min_observations
+        offset_seen = torch.logical_and(offset_seen, self.opacity_gradient_denom.view(anchor_count, self.n_offsets) > 0)
+        anchor_seen = torch.logical_and(
+            self.anchor_demon.squeeze(dim=1) >= min_observations,
+            offset_seen.any(dim=1),
+        )
 
         pos_score = pos_grads / self._stable_positive_quantile(pos_grads, 0.9)
         opa_score = opa_grads / self._stable_positive_quantile(opa_grads, 0.9)
-        offset_score = pos_weight * pos_score + opa_weight * opa_score
+        weight_sum = max(pos_weight + opa_weight, 1e-12)
+        offset_score = (pos_weight * pos_score + opa_weight * opa_score) / weight_sum
         pos_score = torch.where(offset_seen, pos_score, torch.zeros_like(pos_score))
         opa_score = torch.where(offset_seen, opa_score, torch.zeros_like(opa_score))
         offset_score = torch.where(offset_seen, offset_score, torch.zeros_like(offset_score))
@@ -1149,9 +1208,9 @@ class GaussianModel:
         if valid_pos.numel() == 0:
             return 0
 
-        weak_pos = anchor_pos_score <= self._stable_quantile(valid_pos, 0.30)
-        weak_opa = anchor_opa_score <= self._stable_quantile(valid_opa, 0.30)
-        weak_alpha = anchor_opacity_score <= self._stable_quantile(valid_alpha, 0.30)
+        weak_pos = anchor_pos_score <= self._stable_quantile(valid_pos, weak_quantile)
+        weak_opa = anchor_opa_score <= self._stable_quantile(valid_opa, weak_quantile)
+        weak_alpha = anchor_opacity_score <= self._stable_quantile(valid_alpha, weak_quantile)
         safe_candidates = torch.logical_and(
             anchor_seen,
             torch.logical_and(torch.logical_and(weak_pos, weak_opa), weak_alpha),
@@ -1171,6 +1230,76 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
         return int(prune_mask.sum().item())
 
+    def suppress_weak_offsets_by_score(
+            self,
+            drop_quantile=0.15,
+            pos_weight=0.5,
+            opa_weight=0.5,
+            min_observations=30):
+        """Drop at most one clearly weak offset per anchor after convergence."""
+        anchor_count = self.get_anchor.shape[0]
+        if anchor_count == 0 or self.offset_denom.numel() == 0:
+            self.set_full_active_offsets()
+            return 0
+
+        pos_grads = self.offset_gradient_accum / self.offset_denom.clamp_min(1.0)
+        pos_grads[~torch.isfinite(pos_grads)] = 0.0
+        pos_grads = torch.norm(pos_grads, dim=-1).view(anchor_count, self.n_offsets)
+
+        opa_grads = self.opacity_gradient_accum / self.opacity_gradient_denom.clamp_min(1.0)
+        opa_grads[~torch.isfinite(opa_grads)] = 0.0
+        opa_grads = opa_grads.squeeze(dim=-1).view(anchor_count, self.n_offsets)
+
+        offset_seen = self.offset_denom.view(anchor_count, self.n_offsets) >= min_observations
+        offset_seen = torch.logical_and(offset_seen, self.opacity_gradient_denom.view(anchor_count, self.n_offsets) > 0)
+        anchor_seen = torch.logical_and(
+            self.anchor_demon.squeeze(dim=1) >= min_observations,
+            offset_seen.any(dim=1),
+        )
+
+        pos_score = pos_grads / self._stable_positive_quantile(pos_grads[offset_seen], 0.9)
+        opa_score = opa_grads / self._stable_positive_quantile(opa_grads[offset_seen], 0.9)
+        weight_sum = max(pos_weight + opa_weight, 1e-12)
+        offset_score = (pos_weight * pos_score + opa_weight * opa_score) / weight_sum
+        pos_score = torch.where(offset_seen, pos_score, torch.zeros_like(pos_score))
+        opa_score = torch.where(offset_seen, opa_score, torch.zeros_like(opa_score))
+        offset_score = torch.where(offset_seen, offset_score, torch.zeros_like(offset_score))
+
+        valid_scores = offset_score[offset_seen]
+        if valid_scores.numel() == 0:
+            self.set_full_active_offsets()
+            return 0
+
+        score_threshold = self._stable_quantile(valid_scores, drop_quantile)
+        pos_threshold = self._stable_quantile(pos_score[offset_seen], drop_quantile)
+        opa_threshold = self._stable_quantile(opa_score[offset_seen], drop_quantile)
+
+        inf_scores = torch.full_like(offset_score, float("inf"))
+        masked_scores = torch.where(offset_seen, offset_score, inf_scores)
+        weakest_score, weakest_ids = masked_scores.min(dim=1)
+        row_ids = torch.arange(anchor_count, device=self.get_anchor.device)
+        weakest_pos = pos_score[row_ids, weakest_ids]
+        weakest_opa = opa_score[row_ids, weakest_ids]
+
+        drop_anchor = torch.logical_and(
+            anchor_seen,
+            torch.logical_and(
+                torch.isfinite(weakest_score),
+                torch.logical_and(
+                    weakest_score <= score_threshold,
+                    torch.logical_and(weakest_pos <= pos_threshold, weakest_opa <= opa_threshold),
+                ),
+            ),
+        )
+
+        active_mask = torch.ones((anchor_count, self.n_offsets), dtype=torch.bool, device=self.get_anchor.device)
+        drop_rows = torch.nonzero(drop_anchor, as_tuple=False).squeeze(dim=1)
+        if drop_rows.numel() > 0:
+            active_mask[drop_rows, weakest_ids[drop_rows]] = False
+
+        self._active_offset_mask = active_mask
+        return int(drop_rows.numel())
+
     def adjust_anchor(
             self,
             check_interval=100,
@@ -1178,34 +1307,18 @@ class GaussianModel:
             grad_threshold=0.0002,
             min_opacity=0.005,
             allow_grow=True,
-            allow_prune=True,
-            use_dual_grow=False,
-            grow_opa_quantile=0.30):
+            allow_prune=True):
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
 
         if allow_grow:
             pos_grads = self.offset_gradient_accum / self.offset_denom.clamp_min(1.0)
             pos_grads[~torch.isfinite(pos_grads)] = 0.0
             pos_grads = torch.norm(pos_grads, dim=-1)
-            grow_mask = offset_mask
-
-            if use_dual_grow:
-                opa_grads = self.opacity_gradient_accum / self.opacity_gradient_denom.clamp_min(1.0)
-                opa_grads[~torch.isfinite(opa_grads)] = 0.0
-                opa_grads = opa_grads.squeeze(dim=1)
-                opa_seen = self.opacity_gradient_denom.squeeze(dim=1) > 0
-                valid_opa = opa_grads[torch.logical_and(torch.logical_and(offset_mask, opa_seen), opa_grads > 0)]
-                if valid_opa.numel() > 0:
-                    opa_threshold = self._stable_positive_quantile(valid_opa, grow_opa_quantile)
-                    grow_mask = torch.logical_and(
-                        offset_mask,
-                        torch.logical_and(opa_seen, opa_grads >= opa_threshold),
-                    )
 
             self.anchor_growing(
                 pos_grads,
                 grad_threshold,
-                grow_mask,
+                offset_mask,
             )
             self._reset_grow_stats(offset_mask)
 

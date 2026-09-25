@@ -145,21 +145,19 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP Safe: use opacity-gradient as a gate for anchor growing,
-        # then prune only a very small set of consistently weak anchors.
+        # FiLM-MP Post: keep FiLM/Scaffold-GS training unchanged first,
+        # then use stable dual-gradient evidence for late compression.
         self.mp_growing = True
-        self.mp_dual_grow_from = 5_000
-        self.mp_grow_until = 15_000
-        self.mp_prune_at = 35_000
-        self.mp_prune_ratio = 0.01
+        self.mp_score_from = 35_000
+        self.mp_compress_at = 40_000
+        self.mp_offset_drop_quantile = 0.15
+        self.mp_anchor_prune_ratio = 0.005
         self.mp_pos_weight = 0.5
         self.mp_opa_weight = 0.5
         self.mp_anchor_score_topk = 5
         self.mp_min_observations = 30
-        self.mp_grow_opa_quantile = 0.30
 
-        # Scaffold-GS densification schedule. FiLM-MP uses it only during
-        # the early grow phase; --no-mp_growing keeps the original window.
+        # Original Scaffold-GS densification schedule.
         self.start_stat = 500
         self.update_from = 1500
         self.update_until = 15_000

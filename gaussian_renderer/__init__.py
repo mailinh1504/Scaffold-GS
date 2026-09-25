@@ -68,7 +68,14 @@ def generate_neural_gaussians(
     else:
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
-    # FiLM-MP Safe keeps the original Scaffold-GS activation rule.
+    active_offset_mask = pc.get_active_offset_mask(visible_mask).to(neural_opacity.device)
+    neural_opacity = torch.where(
+        active_offset_mask,
+        neural_opacity,
+        torch.full_like(neural_opacity, -1e6),
+    )
+
+    # FiLM-MP Post keeps the original Scaffold-GS activation rule.
     neural_opacity = neural_opacity.reshape([-1, 1])
     if is_training and retain_opacity_grad and neural_opacity.requires_grad:
         neural_opacity.retain_grad()

@@ -88,7 +88,7 @@ def saveRuntimeCode(dst: str) -> None:
     print("Backup Finished!")
 
 
-# FiLM-MP: small controller for grow -> dual-gated grow -> safe prune -> refine.
+# FiLM-MP: small controller for original grow -> late score -> compress -> refine.
 def mp_enabled(opt):
     return getattr(opt, "mp_growing", False)
 
@@ -97,13 +97,13 @@ def phase_at(iteration, opt):
     """Return the current FiLM-MP phase."""
     if not mp_enabled(opt):
         return "base"
-    if iteration < opt.mp_dual_grow_from:
+    if iteration < opt.update_until:
         return "grow"
-    if iteration < opt.mp_grow_until:
-        return "dual_grow"
-    if iteration < opt.mp_prune_at:
+    if iteration < opt.mp_score_from:
+        return "refine"
+    if iteration < opt.mp_compress_at:
         return "score"
-    if iteration == opt.mp_prune_at:
+    if iteration == opt.mp_compress_at:
         return "compress"
     return "refine"
 
@@ -111,14 +111,16 @@ def phase_at(iteration, opt):
 def stat_on(iteration, opt):
     """Collect stats while growing or scoring anchors."""
     if mp_enabled(opt):
-        return opt.start_stat < iteration <= opt.mp_prune_at
+        return (opt.start_stat < iteration < opt.update_until) or (
+            opt.mp_score_from <= iteration <= opt.mp_compress_at
+        )
     return opt.start_stat < iteration < opt.update_until
 
 
 def grow_on(iteration, opt, phase):
     """Run anchor growing on the original Scaffold-GS interval."""
     return (
-        phase in {"base", "grow", "dual_grow"}
+        phase in {"base", "grow"}
         and iteration > opt.update_from
         and iteration % opt.update_interval == 0
     )
@@ -132,7 +134,7 @@ def compress_on(phase):
 def free_now(iteration, opt):
     """Free densification buffers once anchors become fixed."""
     if mp_enabled(opt):
-        return iteration > opt.mp_prune_at
+        return iteration > opt.mp_compress_at
     return iteration == opt.update_until
 
 
@@ -182,16 +184,17 @@ def training(
             )
         )
         logger.info(
-            "FiLM-MP Safe: grow<{} dual_grow<{} safe_prune@{} refine>; "
-            "score={}*pos + {}*opacity, prune_ratio={}, min_obs={}, grow_opa_q={}".format(
-                getattr(opt, "mp_dual_grow_from", opt.update_from),
-                getattr(opt, "mp_grow_until", opt.update_until),
-                getattr(opt, "mp_prune_at", opt.update_until),
+            "FiLM-MP Post: original_grow<{} score@{}-{} compress@{} refine; "
+            "score={}*pos + {}*opacity, drop_q={}, anchor_prune={}, min_obs={}".format(
+                getattr(opt, "update_until", 15_000),
+                getattr(opt, "mp_score_from", 35_000),
+                getattr(opt, "mp_compress_at", 40_000),
+                getattr(opt, "mp_compress_at", 40_000),
                 getattr(opt, "mp_pos_weight", 0.5),
                 getattr(opt, "mp_opa_weight", 0.5),
-                getattr(opt, "mp_prune_ratio", 0.01),
+                getattr(opt, "mp_offset_drop_quantile", 0.15),
+                getattr(opt, "mp_anchor_prune_ratio", 0.005),
                 getattr(opt, "mp_min_observations", 30),
-                getattr(opt, "mp_grow_opa_quantile", 0.30),
             )
         )
 
@@ -250,17 +253,11 @@ def training(
         phase = phase_at(iteration, opt)
         gaussians.active_opacity_threshold = active_opacity_threshold(iteration, opt)
         if mp_enabled(opt) and phase != last_phase:
-            if phase == "dual_grow":
+            if phase == "score":
                 gaussians.reset_densification_stats()
                 if logger is not None:
                     logger.info(
-                        "\n[ITER {}] FiLM-MP starts dual-gated growing".format(iteration)
-                    )
-            elif phase == "score":
-                gaussians.reset_densification_stats()
-                if logger is not None:
-                    logger.info(
-                        "\n[ITER {}] FiLM-MP starts stable dual-gradient scoring".format(iteration)
+                        "\n[ITER {}] FiLM-MP starts late stable dual-gradient scoring".format(iteration)
                     )
             last_phase = phase
 
@@ -278,9 +275,9 @@ def training(
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
         stats_on = stat_on(iteration, opt)
-        # FiLM-MP: dual-grow/score phases also store opacity-removal evidence.
-        retain_grad = stats_on and phase in {"base", "grow", "dual_grow", "score", "compress"}
-        retain_opacity_grad = stats_on and phase in {"dual_grow", "score", "compress"}
+        # FiLM-MP: keep original grow; collect opacity-removal evidence only late.
+        retain_grad = stats_on and phase in {"base", "grow", "score", "compress"}
+        retain_opacity_grad = stats_on and phase in {"score", "compress"}
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -377,21 +374,27 @@ def training(
                         min_opacity=opt.min_opacity,
                         allow_grow=True,
                         allow_prune=True,
-                        use_dual_grow=mp_enabled(opt) and phase == "dual_grow",
-                        grow_opa_quantile=opt.mp_grow_opa_quantile,
                     )
                 elif mp_enabled(opt) and compress_on(phase):
+                    dropped = gaussians.suppress_weak_offsets_by_score(
+                        drop_quantile=opt.mp_offset_drop_quantile,
+                        pos_weight=opt.mp_pos_weight,
+                        opa_weight=opt.mp_opa_weight,
+                        min_observations=opt.mp_min_observations,
+                    )
                     pruned = gaussians.prune_weak_anchors_by_score(
-                        prune_ratio=opt.mp_prune_ratio,
+                        prune_ratio=opt.mp_anchor_prune_ratio,
                         pos_weight=opt.mp_pos_weight,
                         opa_weight=opt.mp_opa_weight,
                         topk=opt.mp_anchor_score_topk,
                         min_observations=opt.mp_min_observations,
+                        weak_quantile=opt.mp_offset_drop_quantile,
                     )
                     if logger is not None:
                         logger.info(
-                            "\n[ITER {}] FiLM-MP pruned {} weak anchors".format(
+                            "\n[ITER {}] FiLM-MP compressed {} offsets and pruned {} weak anchors".format(
                                 iteration,
+                                dropped,
                                 pruned,
                             )
                         )
