@@ -88,7 +88,7 @@ def saveRuntimeCode(dst: str) -> None:
     print("Backup Finished!")
 
 
-# FiLM-MP: small controller for grow -> score -> prune twice -> refine.
+# FiLM-MP: small controller for grow -> dual-gated grow -> safe prune -> refine.
 def mp_enabled(opt):
     return getattr(opt, "mp_growing", False)
 
@@ -97,56 +97,48 @@ def phase_at(iteration, opt):
     """Return the current FiLM-MP phase."""
     if not mp_enabled(opt):
         return "base"
-    if iteration < opt.mp_score_from:
+    if iteration < opt.mp_dual_grow_from:
         return "grow"
-    if iteration < opt.mp_first_prune_at:
-        return "score1"
-    if iteration == opt.mp_first_prune_at:
-        return "compress1"
-    if iteration < opt.mp_second_prune_at:
-        return "score2"
-    if iteration == opt.mp_second_prune_at:
-        return "compress2"
+    if iteration < opt.mp_grow_until:
+        return "dual_grow"
+    if iteration < opt.mp_prune_at:
+        return "score"
+    if iteration == opt.mp_prune_at:
+        return "compress"
     return "refine"
 
 
 def stat_on(iteration, opt):
     """Collect stats while growing or scoring anchors."""
     if mp_enabled(opt):
-        return opt.start_stat < iteration <= opt.mp_second_prune_at
+        return opt.start_stat < iteration <= opt.mp_prune_at
     return opt.start_stat < iteration < opt.update_until
 
 
 def grow_on(iteration, opt, phase):
-    """Run the original Scaffold-GS anchor growing schedule."""
+    """Run anchor growing on the original Scaffold-GS interval."""
     return (
-        phase in {"base", "grow"}
+        phase in {"base", "grow", "dual_grow"}
         and iteration > opt.update_from
         and iteration % opt.update_interval == 0
     )
 
 
 def compress_on(phase):
-    """Run a dual-gradient anchor pruning step."""
-    return phase in {"compress1", "compress2"}
+    """Run the single safe dual-gradient pruning step."""
+    return phase == "compress"
 
 
 def free_now(iteration, opt):
     """Free densification buffers once anchors become fixed."""
     if mp_enabled(opt):
-        return iteration > opt.mp_second_prune_at
+        return iteration > opt.mp_prune_at
     return iteration == opt.update_until
 
 
 def active_opacity_threshold(iteration, opt):
-    """Ramp a small opacity activation threshold during late MP refinement."""
-    if not mp_enabled(opt):
-        return 0.0
-    if iteration <= opt.mp_active_threshold_from:
-        return 0.0
-    ramp_steps = max(opt.iterations - opt.mp_active_threshold_from, 1)
-    ramp = min((iteration - opt.mp_active_threshold_from) / ramp_steps, 1.0)
-    return getattr(opt, "mp_active_opacity_threshold", 0.0) * ramp
+    """FiLM-MP keeps the original Scaffold-GS opacity activation rule."""
+    return 0.0
 
 
 def training(
@@ -190,17 +182,16 @@ def training(
             )
         )
         logger.info(
-            "FiLM-MP: grow<{} prune@{}+{} refine>; "
-            "score={}*pos + {}*opacity, prune_ratio={}+{}, active_tau<= {} ramp_from {}".format(
-                getattr(opt, "mp_score_from", opt.update_until),
-                getattr(opt, "mp_first_prune_at", opt.update_until),
-                getattr(opt, "mp_second_prune_at", opt.update_until),
-                getattr(opt, "mp_pos_weight", 0.3),
-                getattr(opt, "mp_opa_weight", 0.7),
-                getattr(opt, "mp_first_prune_ratio", 0.03),
-                getattr(opt, "mp_second_prune_ratio", 0.02),
-                getattr(opt, "mp_active_opacity_threshold", 0.0),
-                getattr(opt, "mp_active_threshold_from", opt.iterations),
+            "FiLM-MP Safe: grow<{} dual_grow<{} safe_prune@{} refine>; "
+            "score={}*pos + {}*opacity, prune_ratio={}, min_obs={}, grow_opa_q={}".format(
+                getattr(opt, "mp_dual_grow_from", opt.update_from),
+                getattr(opt, "mp_grow_until", opt.update_until),
+                getattr(opt, "mp_prune_at", opt.update_until),
+                getattr(opt, "mp_pos_weight", 0.5),
+                getattr(opt, "mp_opa_weight", 0.5),
+                getattr(opt, "mp_prune_ratio", 0.01),
+                getattr(opt, "mp_min_observations", 30),
+                getattr(opt, "mp_grow_opa_quantile", 0.30),
             )
         )
 
@@ -259,7 +250,13 @@ def training(
         phase = phase_at(iteration, opt)
         gaussians.active_opacity_threshold = active_opacity_threshold(iteration, opt)
         if mp_enabled(opt) and phase != last_phase:
-            if phase == "score1":
+            if phase == "dual_grow":
+                gaussians.reset_densification_stats()
+                if logger is not None:
+                    logger.info(
+                        "\n[ITER {}] FiLM-MP starts dual-gated growing".format(iteration)
+                    )
+            elif phase == "score":
                 gaussians.reset_densification_stats()
                 if logger is not None:
                     logger.info(
@@ -281,9 +278,9 @@ def training(
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe, background)
         stats_on = stat_on(iteration, opt)
-        # FiLM-MP: grow uses position stats; score/compress also stores opacity-removal stats.
-        retain_grad = stats_on and phase in {"base", "grow", "score1", "score2", "compress1", "compress2"}
-        retain_opacity_grad = stats_on and phase in {"score1", "score2", "compress1", "compress2"}
+        # FiLM-MP: dual-grow/score phases also store opacity-removal evidence.
+        retain_grad = stats_on and phase in {"base", "grow", "dual_grow", "score", "compress"}
+        retain_opacity_grad = stats_on and phase in {"dual_grow", "score", "compress"}
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -380,15 +377,12 @@ def training(
                         min_opacity=opt.min_opacity,
                         allow_grow=True,
                         allow_prune=True,
+                        use_dual_grow=mp_enabled(opt) and phase == "dual_grow",
+                        grow_opa_quantile=opt.mp_grow_opa_quantile,
                     )
                 elif mp_enabled(opt) and compress_on(phase):
-                    prune_ratio = (
-                        opt.mp_first_prune_ratio
-                        if phase == "compress1"
-                        else opt.mp_second_prune_ratio
-                    )
                     pruned = gaussians.prune_weak_anchors_by_score(
-                        prune_ratio=prune_ratio,
+                        prune_ratio=opt.mp_prune_ratio,
                         pos_weight=opt.mp_pos_weight,
                         opa_weight=opt.mp_opa_weight,
                         topk=opt.mp_anchor_score_topk,
@@ -401,12 +395,9 @@ def training(
                                 pruned,
                             )
                         )
-                    if phase == "compress1":
-                        gaussians.reset_densification_stats()
-                    else:
-                        gaussians.release_densification_stats()
-                        stats_freed = True
-                        torch.cuda.empty_cache()
+                    gaussians.release_densification_stats()
+                    stats_freed = True
+                    torch.cuda.empty_cache()
             elif not stats_freed and free_now(iteration, opt):
                 # FiLM-MP: refinement needs no densification buffers.
                 gaussians.release_densification_stats()
@@ -482,7 +473,7 @@ def get_model_size_mb(model_path, iteration):
 
 def apply_render_options(gaussians, opt):
     if opt is not None and mp_enabled(opt):
-        gaussians.active_opacity_threshold = getattr(opt, "mp_active_opacity_threshold", 0.0)
+        gaussians.active_opacity_threshold = 0.0
 
 
 def training_report(

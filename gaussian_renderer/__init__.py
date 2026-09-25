@@ -68,12 +68,11 @@ def generate_neural_gaussians(
     else:
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
-    # FiLM-MP: late refinement can skip very weak active opacities.
+    # FiLM-MP Safe keeps the original Scaffold-GS activation rule.
     neural_opacity = neural_opacity.reshape([-1, 1])
     if is_training and retain_opacity_grad and neural_opacity.requires_grad:
         neural_opacity.retain_grad()
-    active_threshold = getattr(pc, "active_opacity_threshold", 0.0)
-    mask = neural_opacity > active_threshold
+    mask = neural_opacity > 0.0
     mask = mask.view(-1)
 
     # select opacity

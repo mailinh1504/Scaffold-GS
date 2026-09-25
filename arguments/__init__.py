@@ -145,20 +145,18 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP Balanced: prune weak anchors very lightly, then ramp a
-        # small active-opacity threshold late to reduce rendered Gaussians.
+        # FiLM-MP Safe: use opacity-gradient as a gate for anchor growing,
+        # then prune only a very small set of consistently weak anchors.
         self.mp_growing = True
-        self.mp_score_from = 15_000
-        self.mp_first_prune_at = 30_000
-        self.mp_second_prune_at = 42_000
-        self.mp_first_prune_ratio = 0.02
-        self.mp_second_prune_ratio = 0.01
-        self.mp_pos_weight = 0.4
-        self.mp_opa_weight = 0.6
+        self.mp_dual_grow_from = 5_000
+        self.mp_grow_until = 15_000
+        self.mp_prune_at = 35_000
+        self.mp_prune_ratio = 0.01
+        self.mp_pos_weight = 0.5
+        self.mp_opa_weight = 0.5
         self.mp_anchor_score_topk = 5
-        self.mp_min_observations = 20
-        self.mp_active_threshold_from = 45_000
-        self.mp_active_opacity_threshold = 0.005
+        self.mp_min_observations = 30
+        self.mp_grow_opa_quantile = 0.30
 
         # Scaffold-GS densification schedule. FiLM-MP uses it only during
         # the early grow phase; --no-mp_growing keeps the original window.
