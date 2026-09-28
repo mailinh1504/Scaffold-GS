@@ -1135,10 +1135,10 @@ class GaussianModel:
 
     def select_grow_offsets_by_score(
             self,
-            gate_quantile=0.20,
-            pos_weight=0.7,
-            opa_weight=0.3,
-            min_observations=20):
+            gate_quantile=0.30,
+            pos_weight=0.8,
+            opa_weight=0.2,
+            min_observations=30):
         """Select offsets that may create new anchors during gated growing.
 
         Rendering is not changed. The selected mask is used only by
@@ -1179,21 +1179,34 @@ class GaussianModel:
             return 0
 
         score_threshold = self._stable_quantile(valid_scores, gate_quantile)
+        pos_threshold = self._stable_quantile(pos_score[offset_seen], gate_quantile)
+        opa_threshold = self._stable_quantile(opa_score[offset_seen], gate_quantile)
         grow_mask = torch.ones((anchor_count, self.n_offsets), dtype=torch.bool, device=self.get_anchor.device)
-        weak_seen_offsets = torch.logical_and(offset_seen, offset_score <= score_threshold)
-        grow_mask[weak_seen_offsets] = False
+        weak_offsets = torch.logical_and(
+            offset_seen,
+            torch.logical_and(
+                offset_score <= score_threshold,
+                torch.logical_and(pos_score <= pos_threshold, opa_score <= opa_threshold),
+            ),
+        )
 
-        # Safety: every anchor keeps at least one observed offset for growing.
-        empty_rows = torch.logical_and(anchor_seen, ~grow_mask.any(dim=1))
-        if empty_rows.any():
-            minus_inf = torch.full_like(offset_score, -float("inf"))
-            observed_scores = torch.where(offset_seen, offset_score, minus_inf)
-            best_ids = observed_scores.argmax(dim=1)
-            row_ids = torch.nonzero(empty_rows, as_tuple=False).squeeze(dim=1)
-            grow_mask[row_ids, best_ids[row_ids]] = True
+        # Conservative gate: each anchor may lose at most its weakest offset.
+        inf_scores = torch.full_like(offset_score, float("inf"))
+        weak_scores = torch.where(weak_offsets, offset_score, inf_scores)
+        weakest_score, weakest_ids = weak_scores.min(dim=1)
+        observed_count = offset_seen.sum(dim=1)
+        drop_rows = torch.nonzero(
+            torch.logical_and(
+                anchor_seen,
+                torch.logical_and(torch.isfinite(weakest_score), observed_count > 1),
+            ),
+            as_tuple=False,
+        ).squeeze(dim=1)
+        if drop_rows.numel() > 0:
+            grow_mask[drop_rows, weakest_ids[drop_rows]] = False
 
         self._active_offset_mask = grow_mask
-        return int((~grow_mask).sum().item())
+        return int(drop_rows.numel())
 
     def adjust_anchor(
             self,

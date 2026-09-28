@@ -148,12 +148,12 @@ class OptimizationParams(ParamGroup):
         # FiLM-MP Grow-Gated: use stable position + opacity gradients to
         # decide which offsets may create new anchors. Rendering stays unchanged.
         self.mp_growing = True
-        self.mp_score_from = 10_000
-        self.mp_gate_at = 12_000
-        self.mp_gate_quantile = 0.20
-        self.mp_pos_weight = 0.7
-        self.mp_opa_weight = 0.3
-        self.mp_min_observations = 20
+        self.mp_score_from = 8_000
+        self.mp_gate_at = 10_000
+        self.mp_gate_quantile = 0.30
+        self.mp_pos_weight = 0.8
+        self.mp_opa_weight = 0.2
+        self.mp_min_observations = 30
 
         # Original Scaffold-GS densification schedule.
         self.start_stat = 500

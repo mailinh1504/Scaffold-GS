@@ -94,11 +94,11 @@ def mp_enabled(opt):
 
 
 def mp_gate_at(opt):
-    return getattr(opt, "mp_gate_at", 12_000)
+    return getattr(opt, "mp_gate_at", 10_000)
 
 
 def mp_gate_quantile(opt):
-    return getattr(opt, "mp_gate_quantile", 0.20)
+    return getattr(opt, "mp_gate_quantile", 0.30)
 
 
 def phase_at(iteration, opt):
@@ -190,14 +190,14 @@ def training(
         logger.info(
             "FiLM-MP Grow-Gated: grow<{} score@{}-{} gated_grow<{} refine; "
             "score=pos * ({} + {} * clamp(opacity, 0, 1)), gate_q={}, min_obs={}".format(
-                getattr(opt, "mp_score_from", 10_000),
-                getattr(opt, "mp_score_from", 35_000),
+                getattr(opt, "mp_score_from", 8_000),
+                getattr(opt, "mp_score_from", 8_000),
                 mp_gate_at(opt),
                 getattr(opt, "update_until", 15_000),
-                getattr(opt, "mp_pos_weight", 0.7),
-                getattr(opt, "mp_opa_weight", 0.3),
+                getattr(opt, "mp_pos_weight", 0.8),
+                getattr(opt, "mp_opa_weight", 0.2),
                 mp_gate_quantile(opt),
-                getattr(opt, "mp_min_observations", 20),
+                getattr(opt, "mp_min_observations", 30),
             )
         )
 
