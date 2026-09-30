@@ -94,11 +94,11 @@ def mp_enabled(opt):
 
 
 def mp_gate_at(opt):
-    return getattr(opt, "mp_gate_at", 10_000)
+    return getattr(opt, "mp_gate_at", 11_500)
 
 
 def mp_gate_quantile(opt):
-    return getattr(opt, "mp_gate_quantile", 0.30)
+    return getattr(opt, "mp_gate_quantile", 0.15)
 
 
 def phase_at(iteration, opt):
@@ -124,7 +124,7 @@ def stat_on(iteration, opt):
 def grow_on(iteration, opt, phase):
     """Run anchor growing on the configured Scaffold-GS interval."""
     return (
-        phase in {"base", "grow", "gated_grow"}
+        phase in {"base", "grow", "score", "gated_grow"}
         and iteration > opt.update_from
         and iteration % opt.update_interval == 0
     )
@@ -190,12 +190,12 @@ def training(
         logger.info(
             "FiLM-MP Grow-Gated: grow<{} score@{}-{} gated_grow<{} refine; "
             "score=pos * ({} + {} * clamp(opacity, 0, 1)), gate_q={}, min_obs={}".format(
-                getattr(opt, "mp_score_from", 8_000),
-                getattr(opt, "mp_score_from", 8_000),
+                getattr(opt, "mp_score_from", 9_000),
+                getattr(opt, "mp_score_from", 9_000),
                 mp_gate_at(opt),
                 getattr(opt, "update_until", 15_000),
-                getattr(opt, "mp_pos_weight", 0.8),
-                getattr(opt, "mp_opa_weight", 0.2),
+                getattr(opt, "mp_pos_weight", 0.75),
+                getattr(opt, "mp_opa_weight", 0.25),
                 mp_gate_quantile(opt),
                 getattr(opt, "mp_min_observations", 30),
             )
@@ -257,7 +257,7 @@ def training(
         gaussians.active_opacity_threshold = active_opacity_threshold(iteration, opt)
         if mp_enabled(opt) and phase != last_phase:
             if phase == "score":
-                gaussians.reset_densification_stats()
+                gaussians.reset_mp_score_stats()
                 if logger is not None:
                     logger.info(
                         "\n[ITER {}] FiLM-MP starts stable dual-gradient scoring for grow gating".format(iteration)
@@ -368,6 +368,7 @@ def training(
                     voxel_visible_mask,
                     use_grad=retain_grad,
                     use_opacity_grad=retain_opacity_grad,
+                    use_mp_score=retain_opacity_grad,
                 )
 
                 if gate_on(iteration, opt):
