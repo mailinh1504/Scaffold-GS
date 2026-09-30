@@ -98,19 +98,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     training_time_start = time.time()
-    ak_stats_until = opt.adaptive_k_select_at + 1 if opt.adaptive_k else opt.update_until
+    ak_update_until = getattr(opt, "adaptive_k_update_until", opt.update_until)
+    ak_stats_until = ak_update_until + 1 if opt.adaptive_k else opt.update_until
     stats_until = max(opt.update_until, ak_stats_until)
     if logger is not None and opt.adaptive_k:
         logger.info(
-            "FiLM-AK Early-Safe: warm-up full offsets; collect dual-gradient stats from {} to {}; drop_q={}; score=Top{}; min_obs={}; weights pos/opa_grad={}/{}; anchor_prune={}".format(
+            "FiLM-AK: full offsets until {}; update K every {} iters until {}; K={}/{}/{} by Q{}/Q{} Top{} position-gradient score; min_obs={}".format(
                 opt.adaptive_k_stat_from,
-                opt.adaptive_k_select_at,
-                opt.adaptive_k_drop_quantile,
+                opt.adaptive_k_update_interval,
+                ak_update_until,
+                opt.adaptive_k_easy,
+                opt.adaptive_k_mid,
+                opt.adaptive_k_hard,
+                opt.adaptive_k_q_low,
+                opt.adaptive_k_q_high,
                 opt.adaptive_k_score_topk,
                 opt.adaptive_k_min_observations,
-                opt.adaptive_k_grad_weight,
-                opt.adaptive_k_opacity_grad_weight,
-                opt.adaptive_k_anchor_prune_ratio,
             )
         )
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -133,13 +136,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
-        # FiLM-AK Early-Safe: use the selected offset mask from select_at
-        # onward, including the last densification iterations before 15k.
-        gaussians.adaptive_k_enabled = opt.adaptive_k and iteration >= opt.adaptive_k_select_at
+        # FiLM-AK: before stat_from the renderer uses all offsets. From
+        # stat_from onward, it uses the latest K mask; initially that mask is
+        # still full, then it is updated periodically and frozen after 35k.
+        gaussians.adaptive_k_enabled = opt.adaptive_k and iteration >= opt.adaptive_k_stat_from
         if opt.adaptive_k and iteration == opt.adaptive_k_stat_from:
             gaussians.reset_adaptive_k_stats()
             if logger is not None:
-                logger.info("\n[ITER {}] FiLM-AK Early-Safe resets stable offset statistics".format(iteration))
+                logger.info("\n[ITER {}] FiLM-AK resets stable offset-gradient statistics".format(iteration))
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -155,9 +159,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             pipe.debug = True
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
-        collect_ak_stats = opt.adaptive_k and opt.adaptive_k_stat_from <= iteration <= opt.adaptive_k_select_at
+        collect_ak_stats = opt.adaptive_k and opt.adaptive_k_stat_from <= iteration <= ak_update_until
         retain_grad = (iteration < stats_until and iteration >= 0)
-        retain_opacity_grad = collect_ak_stats
+        retain_opacity_grad = False
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -205,26 +209,27 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     visibility_filter,
                     offset_selection_mask,
                     voxel_visible_mask,
-                    use_opacity_grad=retain_opacity_grad,
+                    use_adaptive_k_stats=collect_ak_stats,
+                    use_opacity_grad=False,
                 )
 
-                # FiLM-AK Early-Safe: select weak offsets before densification
-                # ends; anchor pruning is disabled by default to protect quality.
-                if opt.adaptive_k and iteration == opt.adaptive_k_select_at:
-                    pruned = gaussians.prune_weak_anchors_by_adaptive_k_score(
-                        prune_ratio=opt.adaptive_k_anchor_prune_ratio,
-                    )
+                # FiLM-AK: update the effective offset budget K from position
+                # gradients only. No opacity-gradient score and no anchor prune.
+                if (
+                    collect_ak_stats
+                    and iteration > opt.adaptive_k_stat_from
+                    and iteration % opt.adaptive_k_update_interval == 0
+                ):
                     gaussians.update_active_offsets()
                     if logger is not None:
                         active_offsets = int(gaussians.get_active_offsets().sum().item())
                         stored_offsets = gaussians.get_anchor.shape[0] * gaussians.n_offsets
                         logger.info(
-                            "\n[ITER {}] FiLM-AK Early-Safe selected offsets: active={} stored={} anchors={} pruned={}".format(
+                            "\n[ITER {}] FiLM-AK updates active offsets: active={} stored={} anchors={}".format(
                                 iteration,
                                 active_offsets,
                                 stored_offsets,
                                 gaussians.get_anchor.shape[0],
-                                pruned,
                             )
                         )
 
