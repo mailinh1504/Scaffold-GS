@@ -145,14 +145,18 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP Grow-Gated: use stable position + opacity gradients to
-        # decide which offsets may create new anchors. Rendering stays unchanged.
+        # FiLM-MP Safe-Pruning: keep Scaffold-GS/FiLM growing unchanged, then
+        # use stable position + opacity gradients to prune only weak anchors.
         self.mp_growing = True
-        self.mp_score_from = 9_000
-        self.mp_gate_at = 11_500
-        self.mp_gate_quantile = 0.15
+        self.mp_score_from = 8_000
+        self.mp_prune_from = 10_000
+        self.mp_prune_until = 15_000
+        self.mp_prune_interval = 500
+        self.mp_prune_quantile = 0.10
+        self.mp_prune_max_ratio = 0.003
         self.mp_pos_weight = 0.75
         self.mp_opa_weight = 0.25
+        self.mp_anchor_score_topk = 3
         self.mp_min_observations = 30
 
         # Original Scaffold-GS densification schedule.

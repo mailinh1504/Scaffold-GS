@@ -68,8 +68,8 @@ def generate_neural_gaussians(
     else:
         neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
 
-    # FiLM-MP Grow-Gated keeps rendering unchanged. The MP mask is used only
-    # inside anchor growing, not to suppress offsets during rendering.
+    # FiLM-MP Safe-Pruning keeps rendering unchanged; MP only prunes weak
+    # anchors during training and never suppresses offsets here.
     neural_opacity = neural_opacity.reshape([-1, 1])
     if is_training and retain_opacity_grad and neural_opacity.requires_grad:
         neural_opacity.retain_grad()

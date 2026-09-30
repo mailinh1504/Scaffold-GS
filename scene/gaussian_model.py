@@ -356,6 +356,7 @@ class GaussianModel:
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+        self.mp_opacity_accum = torch.empty(0)
         self.mp_offset_gradient_accum = torch.empty(0)
         self.mp_opacity_gradient_accum = torch.empty(0)
         self.mp_opacity_gradient_denom = torch.empty(0)
@@ -594,8 +595,8 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
 
         self.reset_densification_stats()
-        # FiLM-MP Grow-Gated computes a fresh grow gate every training run.
-        # Do not reuse any stale offset mask from older saved models.
+        # FiLM-MP Safe-Pruning does not use persistent offset masks.
+        # Do not reuse any stale mask from older saved models.
         self.set_full_active_offsets()
 
 
@@ -718,6 +719,7 @@ class GaussianModel:
     def reset_mp_score_stats(self):
         anchor_count = self.get_anchor.shape[0]
         offset_count = anchor_count * self.n_offsets
+        self.mp_opacity_accum = torch.zeros((anchor_count, 1), device="cuda")
         self.mp_offset_gradient_accum = torch.zeros((offset_count, 1), device="cuda")
         self.mp_opacity_gradient_accum = torch.zeros((offset_count, 1), device="cuda")
         self.mp_opacity_gradient_denom = torch.zeros((offset_count, 1), device="cuda")
@@ -735,6 +737,7 @@ class GaussianModel:
 
         pad_count = target_count - current_count
         for name in (
+            "mp_opacity_accum",
             "mp_offset_gradient_accum",
             "mp_opacity_gradient_accum",
             "mp_opacity_gradient_denom",
@@ -749,6 +752,8 @@ class GaussianModel:
         if anchor_pad > 0:
             padding = torch.zeros((anchor_pad, 1), dtype=self.mp_anchor_demon.dtype, device=self.mp_anchor_demon.device)
             self.mp_anchor_demon = torch.cat([self.mp_anchor_demon, padding], dim=0)
+            padding = torch.zeros((anchor_pad, 1), dtype=self.mp_opacity_accum.dtype, device=self.mp_opacity_accum.device)
+            self.mp_opacity_accum = torch.cat([self.mp_opacity_accum, padding], dim=0)
 
     # FiLM-MP: fixed-anchor refinement does not need densification buffers.
     def release_densification_stats(self):
@@ -759,6 +764,7 @@ class GaussianModel:
             "opacity_gradient_denom",
             "offset_denom",
             "anchor_demon",
+            "mp_opacity_accum",
             "mp_offset_gradient_accum",
             "mp_opacity_gradient_accum",
             "mp_opacity_gradient_denom",
@@ -926,6 +932,7 @@ class GaussianModel:
         if use_mp_score:
             target_count = self.get_anchor.shape[0] * self.n_offsets
             self._pad_mp_score_stats(target_count)
+            self.mp_opacity_accum[anchor_visible_mask] += temp_opacity.sum(dim=1, keepdim=True)
             self.mp_anchor_demon[anchor_visible_mask] += 1
         if not use_grad:
             return
@@ -1180,6 +1187,7 @@ class GaussianModel:
             and self.mp_anchor_demon.shape[0] == prune_mask.shape[0]
         )
         if has_mp_stats:
+            self.mp_opacity_accum = self.mp_opacity_accum[~prune_mask]
             self.mp_offset_denom = self.mp_offset_denom.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
             self.mp_offset_gradient_accum = self.mp_offset_gradient_accum.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
             self.mp_opacity_gradient_accum = self.mp_opacity_gradient_accum.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
@@ -1204,20 +1212,38 @@ class GaussianModel:
 
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
-    def select_grow_offsets_by_score(
+    def _prune_stats_by_mask(self, prune_mask):
+        self.offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+        self.offset_gradient_accum = self.offset_gradient_accum.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+        self.opacity_gradient_accum = self.opacity_gradient_accum.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+        self.opacity_gradient_denom = self.opacity_gradient_denom.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+
+        if self.mp_offset_denom.numel() != 0 and self.mp_anchor_demon.shape[0] == prune_mask.shape[0]:
+            self.mp_opacity_accum = self.mp_opacity_accum[~prune_mask]
+            self.mp_offset_denom = self.mp_offset_denom.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+            self.mp_offset_gradient_accum = self.mp_offset_gradient_accum.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+            self.mp_opacity_gradient_accum = self.mp_opacity_gradient_accum.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+            self.mp_opacity_gradient_denom = self.mp_opacity_gradient_denom.view([-1, self.n_offsets])[~prune_mask].view([-1, 1])
+            self.mp_anchor_demon = self.mp_anchor_demon[~prune_mask]
+
+        self.opacity_accum = self.opacity_accum[~prune_mask]
+        self.anchor_demon = self.anchor_demon[~prune_mask]
+
+    def prune_weak_anchors_by_mp_score(
             self,
-            gate_quantile=0.15,
+            prune_ratio=0.003,
             pos_weight=0.75,
             opa_weight=0.25,
-            min_observations=30):
-        """Select offsets that may create new anchors during gated growing.
+            topk=3,
+            min_observations=30,
+            weak_quantile=0.10):
+        """Safely prune anchors weak in opacity and dual-gradient score.
 
-        Rendering is not changed. The selected mask is used only by
-        adjust_anchor() to prevent weak offsets from triggering anchor_growing.
+        FiLM-MP does not gate offset growing here. It lets Scaffold-GS grow as
+        usual and only removes anchors that are weak after enough observations.
         """
         anchor_count = self.get_anchor.shape[0]
-        if anchor_count == 0 or self.mp_offset_denom.numel() == 0:
-            self.set_full_active_offsets()
+        if anchor_count == 0 or prune_ratio <= 0 or self.mp_offset_denom.numel() == 0:
             return 0
 
         pos_grads = self.mp_offset_gradient_accum / self.mp_offset_denom.clamp_min(1.0)
@@ -1237,47 +1263,49 @@ class GaussianModel:
 
         pos_score = pos_grads / self._stable_positive_quantile(pos_grads[offset_seen], 0.9)
         opa_score = opa_grads / self._stable_positive_quantile(opa_grads[offset_seen], 0.9)
-        # FiLM-MP Grow-Gated score:
+        # FiLM-MP Safe-Pruning score:
         # position is the main signal; opacity gradient only confirms it.
         offset_score = pos_score * (pos_weight + opa_weight * opa_score.clamp(0.0, 1.0))
         pos_score = torch.where(offset_seen, pos_score, torch.zeros_like(pos_score))
         opa_score = torch.where(offset_seen, opa_score, torch.zeros_like(opa_score))
         offset_score = torch.where(offset_seen, offset_score, torch.zeros_like(offset_score))
 
-        valid_scores = offset_score[offset_seen]
-        if valid_scores.numel() == 0:
-            self.set_full_active_offsets()
+        valid_anchors = anchor_seen
+        if valid_anchors.sum() == 0:
             return 0
 
-        score_threshold = self._stable_quantile(valid_scores, gate_quantile)
-        pos_threshold = self._stable_quantile(pos_score[offset_seen], gate_quantile)
-        opa_threshold = self._stable_quantile(opa_score[offset_seen], gate_quantile)
-        grow_mask = torch.ones((anchor_count, self.n_offsets), dtype=torch.bool, device=self.get_anchor.device)
-        weak_offsets = torch.logical_and(
-            offset_seen,
+        k = min(max(int(topk), 1), self.n_offsets)
+        anchor_score = torch.topk(offset_score, k=k, dim=1).values.mean(dim=1)
+        anchor_opacity = (self.mp_opacity_accum / self.mp_anchor_demon.clamp_min(1.0)).squeeze(dim=1)
+        anchor_opacity_score = anchor_opacity / self._stable_positive_quantile(
+            anchor_opacity[valid_anchors],
+            0.9,
+        )
+
+        score_threshold = self._stable_quantile(anchor_score[valid_anchors], weak_quantile)
+        opacity_threshold = self._stable_quantile(anchor_opacity_score[valid_anchors], weak_quantile)
+        weak_anchor = torch.logical_and(
+            valid_anchors,
             torch.logical_and(
-                offset_score <= score_threshold,
-                torch.logical_and(pos_score <= pos_threshold, opa_score <= opa_threshold),
+                anchor_score <= score_threshold,
+                anchor_opacity_score <= opacity_threshold,
             ),
         )
 
-        # Conservative gate: each anchor may lose at most its weakest offset.
-        inf_scores = torch.full_like(offset_score, float("inf"))
-        weak_scores = torch.where(weak_offsets, offset_score, inf_scores)
-        weakest_score, weakest_ids = weak_scores.min(dim=1)
-        observed_count = offset_seen.sum(dim=1)
-        drop_rows = torch.nonzero(
-            torch.logical_and(
-                anchor_seen,
-                torch.logical_and(torch.isfinite(weakest_score), observed_count > 1),
-            ),
-            as_tuple=False,
-        ).squeeze(dim=1)
-        if drop_rows.numel() > 0:
-            grow_mask[drop_rows, weakest_ids[drop_rows]] = False
+        prune_count = min(int(anchor_count * prune_ratio), int(weak_anchor.sum().item()))
+        if prune_count <= 0:
+            return 0
 
-        self._active_offset_mask = grow_mask
-        return int(drop_rows.numel())
+        candidate_ids = torch.nonzero(weak_anchor, as_tuple=False).squeeze(dim=1)
+        candidate_score = anchor_score[candidate_ids] + anchor_opacity_score[candidate_ids]
+        prune_ids = candidate_ids[torch.topk(candidate_score, k=prune_count, largest=False).indices]
+
+        prune_mask = torch.zeros(anchor_count, dtype=torch.bool, device=self.get_anchor.device)
+        prune_mask[prune_ids] = True
+        self._prune_stats_by_mask(prune_mask)
+        self.prune_anchor(prune_mask)
+        self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        return int(prune_mask.sum().item())
 
     def adjust_anchor(
             self,
@@ -1290,10 +1318,6 @@ class GaussianModel:
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
 
         if allow_grow:
-            # FiLM-MP Grow-Gated: inactive offsets still render normally, but
-            # they are not allowed to trigger new anchor creation.
-            grow_offset_mask = torch.logical_and(offset_mask, self.get_active_offset_mask().view(-1))
-
             pos_grads = self.offset_gradient_accum / self.offset_denom.clamp_min(1.0)
             pos_grads[~torch.isfinite(pos_grads)] = 0.0
             pos_grads = torch.norm(pos_grads, dim=-1)
@@ -1301,7 +1325,7 @@ class GaussianModel:
             self.anchor_growing(
                 pos_grads,
                 grad_threshold,
-                grow_offset_mask,
+                offset_mask,
             )
             self._reset_grow_stats(offset_mask)
 
