@@ -728,7 +728,6 @@ class GaussianModel:
 
     def _pad_mp_score_stats(self, target_count):
         if self.mp_offset_denom.numel() == 0:
-            self.reset_mp_score_stats()
             return
 
         current_count = self.mp_offset_denom.shape[0]
@@ -737,7 +736,6 @@ class GaussianModel:
 
         pad_count = target_count - current_count
         for name in (
-            "mp_opacity_accum",
             "mp_offset_gradient_accum",
             "mp_opacity_gradient_accum",
             "mp_opacity_gradient_denom",
