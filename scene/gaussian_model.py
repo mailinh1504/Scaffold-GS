@@ -1234,8 +1234,9 @@ class GaussianModel:
             opa_weight=0.25,
             topk=3,
             min_observations=30,
-            weak_quantile=0.10):
-        """Safely prune anchors weak in opacity and dual-gradient score.
+            weak_quantile=0.10,
+            opacity_quantile=0.20):
+        """Safely prune anchors weak in position, opacity-gradient, and opacity.
 
         FiLM-MP does not gate offset growing here. It lets Scaffold-GS grow as
         usual and only removes anchors that are weak after enough observations.
@@ -1254,39 +1255,41 @@ class GaussianModel:
 
         offset_seen = self.mp_offset_denom.view(anchor_count, self.n_offsets) >= min_observations
         offset_seen = torch.logical_and(offset_seen, self.mp_opacity_gradient_denom.view(anchor_count, self.n_offsets) > 0)
+        k = min(max(int(topk), 1), self.n_offsets)
         anchor_seen = torch.logical_and(
             self.mp_anchor_demon.squeeze(dim=1) >= min_observations,
-            offset_seen.any(dim=1),
+            offset_seen.sum(dim=1) >= k,
         )
 
         pos_score = pos_grads / self._stable_positive_quantile(pos_grads[offset_seen], 0.9)
         opa_score = opa_grads / self._stable_positive_quantile(opa_grads[offset_seen], 0.9)
-        # FiLM-MP Safe-Pruning score:
-        # position is the main signal; opacity gradient only confirms it.
-        offset_score = pos_score * (pos_weight + opa_weight * opa_score.clamp(0.0, 1.0))
         pos_score = torch.where(offset_seen, pos_score, torch.zeros_like(pos_score))
         opa_score = torch.where(offset_seen, opa_score, torch.zeros_like(opa_score))
-        offset_score = torch.where(offset_seen, offset_score, torch.zeros_like(offset_score))
 
         valid_anchors = anchor_seen
         if valid_anchors.sum() == 0:
             return 0
 
-        k = min(max(int(topk), 1), self.n_offsets)
-        anchor_score = torch.topk(offset_score, k=k, dim=1).values.mean(dim=1)
+        # Balanced pruning: remove an anchor only when all three signals are weak.
+        anchor_pos_score = torch.topk(pos_score, k=k, dim=1).values.mean(dim=1)
+        anchor_opa_score = torch.topk(opa_score, k=k, dim=1).values.mean(dim=1)
         anchor_opacity = (self.mp_opacity_accum / self.mp_anchor_demon.clamp_min(1.0)).squeeze(dim=1)
         anchor_opacity_score = anchor_opacity / self._stable_positive_quantile(
             anchor_opacity[valid_anchors],
             0.9,
         )
 
-        score_threshold = self._stable_quantile(anchor_score[valid_anchors], weak_quantile)
-        opacity_threshold = self._stable_quantile(anchor_opacity_score[valid_anchors], weak_quantile)
+        pos_threshold = self._stable_quantile(anchor_pos_score[valid_anchors], weak_quantile)
+        opa_threshold = self._stable_quantile(anchor_opa_score[valid_anchors], weak_quantile)
+        opacity_threshold = self._stable_quantile(anchor_opacity_score[valid_anchors], opacity_quantile)
         weak_anchor = torch.logical_and(
             valid_anchors,
             torch.logical_and(
-                anchor_score <= score_threshold,
-                anchor_opacity_score <= opacity_threshold,
+                anchor_pos_score <= pos_threshold,
+                torch.logical_and(
+                    anchor_opa_score <= opa_threshold,
+                    anchor_opacity_score <= opacity_threshold,
+                ),
             ),
         )
 
@@ -1295,7 +1298,11 @@ class GaussianModel:
             return 0
 
         candidate_ids = torch.nonzero(weak_anchor, as_tuple=False).squeeze(dim=1)
-        candidate_score = anchor_score[candidate_ids] + anchor_opacity_score[candidate_ids]
+        candidate_score = (
+            pos_weight * anchor_pos_score[candidate_ids]
+            + opa_weight * anchor_opa_score[candidate_ids]
+            + anchor_opacity_score[candidate_ids]
+        )
         prune_ids = candidate_ids[torch.topk(candidate_score, k=prune_count, largest=False).indices]
 
         prune_mask = torch.zeros(anchor_count, dtype=torch.bool, device=self.get_anchor.device)

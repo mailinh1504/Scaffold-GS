@@ -109,6 +109,10 @@ def mp_prune_quantile(opt):
     return getattr(opt, "mp_prune_quantile", 0.10)
 
 
+def mp_opacity_quantile(opt):
+    return getattr(opt, "mp_opacity_quantile", mp_prune_quantile(opt))
+
+
 def phase_at(iteration, opt):
     """Return the current FiLM-MP phase."""
     if not mp_enabled(opt):
@@ -201,16 +205,16 @@ def training(
             )
         )
         logger.info(
-            "FiLM-MP Safe-Pruning: grow unchanged; score@{} prune@{}-{} every {}; "
-            "score=Top{}[pos * ({} + {} * clamp(opacity, 0, 1))], prune_q={}, max_ratio={}, min_obs={}".format(
+            "FiLM-MP Balanced Compression: grow unchanged; score@{} prune@{}-{} every {}; "
+            "prune if Top{} position/opacity-gradient are weak and opacity is weak; "
+            "grad_q={}, opacity_q={}, max_ratio={}, min_obs={}".format(
                 getattr(opt, "mp_score_from", 8_000),
                 mp_prune_from(opt),
                 mp_prune_until(opt),
                 mp_prune_interval(opt),
                 getattr(opt, "mp_anchor_score_topk", 3),
-                getattr(opt, "mp_pos_weight", 0.75),
-                getattr(opt, "mp_opa_weight", 0.25),
                 mp_prune_quantile(opt),
+                mp_opacity_quantile(opt),
                 getattr(opt, "mp_prune_max_ratio", 0.003),
                 getattr(opt, "mp_min_observations", 30),
             )
@@ -404,6 +408,7 @@ def training(
                         topk=opt.mp_anchor_score_topk,
                         min_observations=opt.mp_min_observations,
                         weak_quantile=mp_prune_quantile(opt),
+                        opacity_quantile=mp_opacity_quantile(opt),
                     )
                     if logger is not None:
                         logger.info(

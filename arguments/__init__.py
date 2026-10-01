@@ -145,19 +145,20 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP Safe-Pruning: keep Scaffold-GS/FiLM growing unchanged until
-        # 15k, collect stable dual-gradient scores, then prune weak anchors late.
+        # FiLM-MP Balanced Compression: grow normally, stabilize, collect
+        # dual-gradient scores, prune weak anchors, then recover by fine-tuning.
         self.mp_growing = True
-        self.mp_score_from = 15_000
-        self.mp_prune_from = 30_000
-        self.mp_prune_until = 38_000
+        self.mp_score_from = 25_000
+        self.mp_prune_from = 35_000
+        self.mp_prune_until = 43_000
         self.mp_prune_interval = 1_000
-        self.mp_prune_quantile = 0.10
-        self.mp_prune_max_ratio = 0.002
-        self.mp_pos_weight = 0.75
-        self.mp_opa_weight = 0.25
+        self.mp_prune_quantile = 0.15
+        self.mp_opacity_quantile = 0.20
+        self.mp_prune_max_ratio = 0.0025
+        self.mp_pos_weight = 0.70
+        self.mp_opa_weight = 0.30
         self.mp_anchor_score_topk = 3
-        self.mp_min_observations = 50
+        self.mp_min_observations = 60
 
         # Original Scaffold-GS densification schedule.
         self.start_stat = 500
