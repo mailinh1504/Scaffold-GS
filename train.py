@@ -123,17 +123,18 @@ def phase_at(iteration, opt):
 
 
 def stat_on(iteration, opt):
-    """Collect densification stats before anchors become fixed."""
+    """Collect grow stats early and MP score stats until the prune phase ends."""
     if mp_enabled(opt):
-        return opt.start_stat < iteration < opt.update_until
+        return opt.start_stat < iteration <= mp_prune_until(opt)
     return opt.start_stat < iteration < opt.update_until
 
 
 def grow_on(iteration, opt, phase):
-    """Run anchor growing on the configured Scaffold-GS interval."""
+    """Run original Scaffold-GS growing only before update_until."""
     return (
         phase in {"base", "grow", "score_prune"}
         and iteration > opt.update_from
+        and iteration < opt.update_until
         and iteration % opt.update_interval == 0
     )
 
@@ -150,7 +151,7 @@ def prune_on(iteration, opt):
 def free_now(iteration, opt):
     """Free densification buffers once anchors become fixed."""
     if mp_enabled(opt):
-        return iteration >= opt.update_until
+        return iteration > mp_prune_until(opt)
     return iteration == opt.update_until
 
 
