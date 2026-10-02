@@ -24,6 +24,11 @@ def generate_neural_gaussians(
     ## view frustum filtering for acceleration
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
+    eval_prune_mask = getattr(pc, "mp_eval_prune_mask", None)
+    if eval_prune_mask is not None and eval_prune_mask.numel() == pc.get_anchor.shape[0]:
+        # FiLM-MP quality gate: temporarily hide candidate anchors to estimate
+        # the rendering impact before permanently pruning them.
+        visible_mask = torch.logical_and(visible_mask, ~eval_prune_mask.to(visible_mask.device))
 
     feat = pc._anchor_feat[visible_mask]
     anchor = pc.get_anchor[visible_mask]

@@ -113,6 +113,10 @@ def mp_opacity_quantile(opt):
     return getattr(opt, "mp_opacity_quantile", mp_prune_quantile(opt))
 
 
+def mp_visibility_quantile(opt):
+    return getattr(opt, "mp_visibility_quantile", 0.30)
+
+
 def phase_at(iteration, opt):
     """Return the current FiLM-MP phase."""
     if not mp_enabled(opt):
@@ -164,6 +168,88 @@ def active_opacity_threshold(iteration, opt):
     return 0.0
 
 
+def mp_probe_cameras(scene, max_views):
+    """Pick a small deterministic camera subset for the MP quality gate."""
+    cameras = scene.getTestCameras()
+    if cameras is None or len(cameras) == 0:
+        cameras = scene.getTrainCameras()
+    if cameras is None or len(cameras) == 0:
+        return []
+
+    max_views = max(1, min(int(max_views), len(cameras)))
+    if max_views == len(cameras):
+        return cameras
+
+    step = max(1, len(cameras) // max_views)
+    selected = []
+    for idx in range(max_views):
+        selected.append(cameras[min(idx * step, len(cameras) - 1)])
+    return selected
+
+
+def mp_probe_metrics(scene, gaussians, pipe, background, max_views):
+    """Render a few views and report SSIM/PSNR/LPIPS for prune gating."""
+    cameras = mp_probe_cameras(scene, max_views)
+    if len(cameras) == 0:
+        return None
+
+    gaussians.eval()
+    ssims, psnrs, lpipss = [], [], []
+    for viewpoint in cameras:
+        voxel_visible_mask = prefilter_voxel(viewpoint, gaussians, pipe, background)
+        image = torch.clamp(
+            render(
+                viewpoint,
+                gaussians,
+                pipe,
+                background,
+                visible_mask=voxel_visible_mask,
+            )["render"],
+            0.0,
+            1.0,
+        )
+        gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+        ssims.append(ssim(image, gt_image).detach())
+        psnrs.append(psnr(image, gt_image).mean().detach())
+        lpipss.append(lpips_fn(image, gt_image).detach().mean())
+    gaussians.train()
+
+    return {
+        "ssim": torch.stack(ssims).mean().item(),
+        "psnr": torch.stack(psnrs).mean().item(),
+        "lpips": torch.stack(lpipss).mean().item(),
+    }
+
+
+def mp_quality_gate_accepts(scene, gaussians, pipe, background, prune_mask, opt):
+    """Accept pruning only if a temporary mask keeps quality within margins."""
+    if not getattr(opt, "mp_quality_gate", True):
+        return True, None, None
+    if prune_mask is None or not prune_mask.any():
+        return True, None, None
+
+    max_views = getattr(opt, "mp_quality_views", 3)
+    base_metrics = mp_probe_metrics(scene, gaussians, pipe, background, max_views)
+    if base_metrics is None:
+        return True, None, None
+
+    gaussians.mp_eval_prune_mask = prune_mask.detach().clone()
+    try:
+        trial_metrics = mp_probe_metrics(scene, gaussians, pipe, background, max_views)
+    finally:
+        gaussians.mp_eval_prune_mask = None
+
+    if trial_metrics is None:
+        return True, base_metrics, None
+
+    accepted = (
+        trial_metrics["ssim"] >= base_metrics["ssim"] - getattr(opt, "mp_max_ssim_drop", 0.0003)
+        and trial_metrics["psnr"] >= base_metrics["psnr"] - getattr(opt, "mp_max_psnr_drop", 0.03)
+        and trial_metrics["lpips"] <= base_metrics["lpips"] + getattr(opt, "mp_max_lpips_increase", 0.0005)
+    )
+    return accepted, base_metrics, trial_metrics
+
+
 def training(
     dataset,
     opt,
@@ -205,9 +291,9 @@ def training(
             )
         )
         logger.info(
-            "FiLM-MP Balanced Compression: grow unchanged; score@{} prune@{}-{} every {}; "
-            "prune if Top{} position/opacity-gradient are weak and opacity is weak; "
-            "grad_q={}, opacity_q={}, max_ratio={}, min_obs={}".format(
+            "FiLM-MP Quality-Gated Compression: grow unchanged; score@{} prune@{}-{} every {}; "
+            "candidate if Top{} position/opacity-gradient, opacity, visibility are weak; "
+            "grad_q={}, opacity_q={}, vis_q={}, max_ratio={}, min_obs={}, gate_views={}".format(
                 getattr(opt, "mp_score_from", 8_000),
                 mp_prune_from(opt),
                 mp_prune_until(opt),
@@ -215,8 +301,10 @@ def training(
                 getattr(opt, "mp_anchor_score_topk", 3),
                 mp_prune_quantile(opt),
                 mp_opacity_quantile(opt),
+                mp_visibility_quantile(opt),
                 getattr(opt, "mp_prune_max_ratio", 0.003),
                 getattr(opt, "mp_min_observations", 30),
+                getattr(opt, "mp_quality_views", 3),
             )
         )
 
@@ -234,6 +322,7 @@ def training(
     training_time_start = time.time()
     last_phase = None
     stats_freed = False
+    mp_pruning_stopped = False
     for iteration in range(first_iter, opt.iterations + 1):
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -400,8 +489,8 @@ def training(
                         allow_prune=True,
                     )
 
-                if prune_on(iteration, opt):
-                    pruned = gaussians.prune_weak_anchors_by_mp_score(
+                if prune_on(iteration, opt) and not mp_pruning_stopped:
+                    prune_mask = gaussians.get_mp_prune_mask(
                         prune_ratio=opt.mp_prune_max_ratio,
                         pos_weight=opt.mp_pos_weight,
                         opa_weight=opt.mp_opa_weight,
@@ -409,13 +498,44 @@ def training(
                         min_observations=opt.mp_min_observations,
                         weak_quantile=mp_prune_quantile(opt),
                         opacity_quantile=mp_opacity_quantile(opt),
+                        visibility_quantile=mp_visibility_quantile(opt),
                     )
+                    candidates = int(prune_mask.sum().item())
+                    accepted, base_metrics, trial_metrics = mp_quality_gate_accepts(
+                        scene,
+                        gaussians,
+                        pipe,
+                        background,
+                        prune_mask,
+                        opt,
+                    )
+                    if accepted:
+                        pruned = gaussians.prune_anchors_by_mask(prune_mask)
+                    else:
+                        pruned = 0
+                        mp_pruning_stopped = True
                     if logger is not None:
+                        gate_msg = ""
+                        if base_metrics is not None and trial_metrics is not None:
+                            gate_msg = (
+                                " gate={} base(ssim={:.6f}, psnr={:.4f}, lpips={:.6f}) "
+                                "trial(ssim={:.6f}, psnr={:.4f}, lpips={:.6f})"
+                            ).format(
+                                "pass" if accepted else "stop",
+                                base_metrics["ssim"],
+                                base_metrics["psnr"],
+                                base_metrics["lpips"],
+                                trial_metrics["ssim"],
+                                trial_metrics["psnr"],
+                                trial_metrics["lpips"],
+                            )
                         logger.info(
-                            "\n[ITER {}] FiLM-MP safe-pruned anchors: pruned={} anchors={}".format(
+                            "\n[ITER {}] FiLM-MP quality-gated prune: candidates={} pruned={} anchors={}{}".format(
                                 iteration,
+                                candidates,
                                 pruned,
                                 gaussians.get_anchor.shape[0],
+                                gate_msg,
                             )
                         )
             elif not stats_freed and free_now(iteration, opt):

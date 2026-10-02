@@ -145,20 +145,27 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
 
-        # FiLM-MP Balanced Compression: grow normally, stabilize, collect
-        # dual-gradient scores, prune weak anchors, then recover by fine-tuning.
+        # FiLM-MP Quality-Gated Compression: train Film first, collect stable
+        # scores late, test prune candidates on a few views, then prune only if
+        # quality stays within the configured safe margin.
         self.mp_growing = True
-        self.mp_score_from = 25_000
-        self.mp_prune_from = 35_000
-        self.mp_prune_until = 43_000
-        self.mp_prune_interval = 1_000
-        self.mp_prune_quantile = 0.15
-        self.mp_opacity_quantile = 0.20
-        self.mp_prune_max_ratio = 0.0025
+        self.mp_score_from = 40_000
+        self.mp_prune_from = 45_000
+        self.mp_prune_until = 48_000
+        self.mp_prune_interval = 500
+        self.mp_prune_quantile = 0.20
+        self.mp_opacity_quantile = 0.25
+        self.mp_visibility_quantile = 0.30
+        self.mp_prune_max_ratio = 0.0015
         self.mp_pos_weight = 0.70
         self.mp_opa_weight = 0.30
         self.mp_anchor_score_topk = 3
-        self.mp_min_observations = 60
+        self.mp_min_observations = 80
+        self.mp_quality_gate = True
+        self.mp_quality_views = 3
+        self.mp_max_ssim_drop = 0.0003
+        self.mp_max_psnr_drop = 0.03
+        self.mp_max_lpips_increase = 0.0005
 
         # Original Scaffold-GS densification schedule.
         self.start_stat = 500
