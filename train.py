@@ -75,8 +75,29 @@ def saveRuntimeCode(dst: str) -> None:
 
 
     shutil.copytree(log_dir, dst, ignore=shutil.ignore_patterns(*ignorePatterns))
-    
+
     print('Backup Finished!')
+
+
+def soft_culling_alpha_at(iteration, opt):
+    if not getattr(opt, "soft_culling", False):
+        return 1.0
+    if iteration <= getattr(opt, "soft_culling_warmup_until", 5_000):
+        return 1.0
+    if iteration <= getattr(opt, "soft_culling_soft_until", 15_000):
+        return getattr(opt, "soft_culling_mid_alpha", 0.5)
+    if iteration <= getattr(opt, "soft_culling_hard_from", 30_000):
+        return getattr(opt, "soft_culling_final_alpha", 0.25)
+    return getattr(opt, "soft_culling_hard_alpha", 0.0)
+
+
+def smc_prune_on(iteration, opt):
+    return (
+        getattr(opt, "soft_culling", False)
+        and getattr(opt, "soft_culling_prune", False)
+        and getattr(opt, "soft_culling_prune_from", 40_000) <= iteration <= getattr(opt, "soft_culling_prune_until", 45_000)
+        and iteration % getattr(opt, "soft_culling_prune_interval", 1_000) == 0
+    )
 
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
@@ -86,6 +107,21 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
+    if logger is not None and getattr(opt, "soft_culling", False):
+        logger.info(
+            "FiLM-SMC Progressive: Top-{} offsets; alpha=1 until {}, {} until {}, {} until {}, then {}; prune={} from {} to {}".format(
+                opt.soft_culling_k,
+                opt.soft_culling_warmup_until,
+                opt.soft_culling_mid_alpha,
+                opt.soft_culling_soft_until,
+                opt.soft_culling_final_alpha,
+                opt.soft_culling_hard_from,
+                opt.soft_culling_hard_alpha,
+                getattr(opt, "soft_culling_prune", False),
+                getattr(opt, "soft_culling_prune_from", 40_000),
+                getattr(opt, "soft_culling_prune_until", 45_000),
+            )
+        )
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -98,6 +134,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     training_time_start = time.time()
+    smc_stats_started = False
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
@@ -118,6 +155,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        if getattr(opt, "soft_culling", False):
+            gaussians.soft_culling_alpha = soft_culling_alpha_at(iteration, opt)
+            if (
+                getattr(opt, "soft_culling_prune", False)
+                and iteration > getattr(opt, "soft_culling_hard_from", 30_000)
+                and not smc_stats_started
+            ):
+                gaussians.reset_smc_prune_stats()
+                smc_stats_started = True
+                if logger is not None:
+                    logger.info("\n[ITER {}] FiLM-SMC starts hard-culling stats for anchor pruning".format(iteration))
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -164,6 +212,26 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+
+            if (
+                smc_stats_started
+                and iteration <= getattr(opt, "soft_culling_prune_until", 45_000)
+            ):
+                gaussians.update_smc_prune_stats(opacity, voxel_visible_mask)
+                if smc_prune_on(iteration, opt):
+                    pruned = gaussians.prune_weak_anchors_by_smc_score(
+                        prune_ratio=getattr(opt, "soft_culling_prune_max_ratio", 0.002),
+                        weak_quantile=getattr(opt, "soft_culling_prune_quantile", 0.10),
+                        min_observations=getattr(opt, "soft_culling_prune_min_observations", 50),
+                    )
+                    if logger is not None:
+                        logger.info(
+                            "\n[ITER {}] FiLM-SMC pruned weak anchors: pruned={} anchors={}".format(
+                                iteration,
+                                pruned,
+                                gaussians.get_anchor.shape[0],
+                            )
+                        )
             
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:

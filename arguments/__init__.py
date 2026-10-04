@@ -152,10 +152,28 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
-        # Soft Culling for FiLM neural Gaussians
+        # FiLM-SMC Progressive Soft-to-Hard Compression.
+        # Keep all offsets early, softly suppress weak offsets in the middle,
+        # then hard-cull weak offsets late to reduce rendered Gaussians.
         self.soft_culling = True
         self.soft_culling_k = 6
-        self.soft_culling_alpha = 0.25
+        self.soft_culling_alpha = 0.0
+        self.soft_culling_warmup_until = 5_000
+        self.soft_culling_soft_until = 15_000
+        self.soft_culling_hard_from = 30_000
+        self.soft_culling_mid_alpha = 0.5
+        self.soft_culling_final_alpha = 0.25
+        self.soft_culling_hard_alpha = 0.0
+
+        # Optional anchor pruning after hard-culling. This is what can reduce
+        # model size; soft/hard offset masking alone only reduces Gaussians/view.
+        self.soft_culling_prune = True
+        self.soft_culling_prune_from = 40_000
+        self.soft_culling_prune_until = 45_000
+        self.soft_culling_prune_interval = 1_000
+        self.soft_culling_prune_quantile = 0.10
+        self.soft_culling_prune_max_ratio = 0.002
+        self.soft_culling_prune_min_observations = 50
 
         super().__init__(parser, "Optimization Parameters")
 

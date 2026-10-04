@@ -354,7 +354,9 @@ class GaussianModel:
         self.anchor_demon = torch.empty(0)
         self.soft_culling_enabled = True
         self.soft_culling_k = min(6, self.n_offsets)
-        self.soft_culling_alpha = 0.25
+        self.soft_culling_alpha = 0.0
+        self.smc_opacity_accum = torch.empty(0)
+        self.smc_anchor_denom = torch.empty(0)
 
         self.optimizer = None
         self.percent_dense = 0
@@ -554,6 +556,7 @@ class GaussianModel:
         self.soft_culling_enabled = getattr(training_args, "soft_culling", True)
         self.soft_culling_k = max(1, min(getattr(training_args, "soft_culling_k", 6), self.n_offsets))
         self.soft_culling_alpha = max(0.0, min(float(getattr(training_args, "soft_culling_alpha", 0.25)), 1.0))
+        self.reset_smc_prune_stats()
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
@@ -665,6 +668,67 @@ class GaussianModel:
             if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
                 param_group['lr'] = lr
+
+    def reset_smc_prune_stats(self):
+        anchor_count = self.get_anchor.shape[0]
+        self.smc_opacity_accum = torch.zeros((anchor_count, 1), device=self.get_anchor.device)
+        self.smc_anchor_denom = torch.zeros((anchor_count, 1), device=self.get_anchor.device)
+
+    def update_smc_prune_stats(self, neural_opacity, anchor_visible_mask):
+        if not self.soft_culling_enabled:
+            return
+        if self.smc_opacity_accum.numel() == 0 or self.smc_opacity_accum.shape[0] != self.get_anchor.shape[0]:
+            self.reset_smc_prune_stats()
+
+        opacity = neural_opacity.detach().view(-1, self.n_offsets)
+        opacity = opacity.clamp_min(0.0)
+        topk = min(self.soft_culling_k, self.n_offsets)
+        anchor_score = torch.topk(opacity, k=topk, dim=1).values.sum(dim=1, keepdim=True)
+        self.smc_opacity_accum[anchor_visible_mask] += anchor_score
+        self.smc_anchor_denom[anchor_visible_mask] += 1
+
+    def prune_weak_anchors_by_smc_score(
+            self,
+            prune_ratio=0.002,
+            weak_quantile=0.10,
+            min_observations=50):
+        anchor_count = self.get_anchor.shape[0]
+        if (
+            anchor_count == 0
+            or prune_ratio <= 0
+            or self.smc_opacity_accum.numel() == 0
+            or self.smc_anchor_denom.numel() == 0
+        ):
+            return 0
+
+        valid_anchor = self.smc_anchor_denom.squeeze(dim=1) >= min_observations
+        if valid_anchor.sum() == 0:
+            return 0
+
+        anchor_score = (self.smc_opacity_accum / self.smc_anchor_denom.clamp_min(1.0)).squeeze(dim=1)
+        valid_scores = anchor_score[valid_anchor]
+        if valid_scores.numel() == 0:
+            return 0
+
+        weak_quantile = min(max(float(weak_quantile), 0.0), 1.0)
+        threshold = torch.quantile(valid_scores.float(), weak_quantile)
+        weak_anchor = torch.logical_and(valid_anchor, anchor_score <= threshold)
+        weak_count = int(weak_anchor.sum().item())
+        if weak_count <= 0:
+            return 0
+
+        prune_count = min(max(1, int(anchor_count * prune_ratio)), weak_count)
+        candidate_ids = torch.nonzero(weak_anchor, as_tuple=False).squeeze(dim=1)
+        prune_ids = candidate_ids[torch.topk(anchor_score[candidate_ids], k=prune_count, largest=False).indices]
+
+        prune_mask = torch.zeros(anchor_count, dtype=torch.bool, device=self.get_anchor.device)
+        prune_mask[prune_ids] = True
+
+        self.smc_opacity_accum = self.smc_opacity_accum[~prune_mask]
+        self.smc_anchor_denom = self.smc_anchor_denom[~prune_mask]
+        self.prune_anchor(prune_mask)
+        self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        return int(prune_mask.sum().item())
 
 
     def construct_list_of_attributes(self):
